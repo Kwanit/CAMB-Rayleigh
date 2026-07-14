@@ -111,10 +111,7 @@ endif
 
 MODOUT =  -J$(OUTPUT_DIR)
 SMODOUT = -J$(DLL_DIR)
-
-ifneq ($(FISHER),)
-F90CRLINK += -lblas -llapack
-endif
+FISHER_LINK = -lblas -llapack
 
 ifeq ($(shell uname -s),Darwin)
 NONNATIVE = 1
@@ -127,13 +124,6 @@ endif
 endif
 
 IFLAG = -I
-
-#Settings for building camb_fits
-#Location of FITSIO and name of library
-FITSDIR       ?= /usr/local/lib
-FITSLIB       = cfitsio
-#Location of HEALPIX for building camb_fits
-HEALPIXDIR    ?= /usr/local/healpix
 
 ifneq ($(FISHER),)
 # Its dependencies are all meet by the libutils.a which always added.
