@@ -32,6 +32,14 @@
         ! Internal accuracy of CosmoRec (0 - normal, 3 - most accurate
         ! other values defined in CosmoRec.cpp source file)
         real(dl) :: accuracy = 0._dl
+        ! Override CosmoRec diffusion iterations; negative uses CosmoRec batch default (2)
+        integer :: diff_iteration_max = -1
+        ! Overrides for selected CosmoRec atomic and radiative-transfer settings
+        integer :: n_shells = -1
+        integer :: n_shells_hei = -1
+        integer :: flag_hi_absorption = -1
+        integer :: n_s_2gamma = -1
+        integer :: n_s_raman = -1
         !Internal data
         class(TRegularCubicSpline), allocatable :: xrec, tmrec
     contains
@@ -53,6 +61,12 @@
     call Ini%Read('cosmorec_runmode', this%runmode)
     call Ini%Read('cosmorec_accuracy', this%accuracy)
     call Ini%Read('cosmorec_fdm', this%fdm)
+    this%diff_iteration_max = Ini%Read_Int('cosmorec_diff_iteration_max', this%diff_iteration_max)
+    this%n_shells = Ini%Read_Int('cosmorec_n_shells', this%n_shells)
+    this%n_shells_hei = Ini%Read_Int('cosmorec_n_shells_hei', this%n_shells_hei)
+    this%flag_hi_absorption = Ini%Read_Int('cosmorec_flag_hi_absorption', this%flag_hi_absorption)
+    this%n_s_2gamma = Ini%Read_Int('cosmorec_n_s_2gamma', this%n_s_2gamma)
+    this%n_s_raman = Ini%Read_Int('cosmorec_n_s_raman', this%n_s_raman)
 
     end subroutine TCosmoRec_ReadParams
 
@@ -71,8 +85,17 @@
         OK = .false.
     end if
 
-    if(this%accuracy < 0.0 .or. this%accuracy > 3.0) then
+    if(this%accuracy < -1.0 .or. this%accuracy > 6.0) then
         write(*,*) "CosmoRec accuracy mode undefined."
+        OK = .false.
+    end if
+    if(this%diff_iteration_max < -1) then
+        write(*,*) "Invalid CosmoRec diffusion iteration override."
+        OK = .false.
+    end if
+    if(this%n_shells < -1 .or. this%n_shells_hei < -1 .or. this%flag_hi_absorption < -1 .or. &
+        this%n_s_2gamma < -1 .or. this%n_s_raman < -1) then
+        write(*,*) "Invalid CosmoRec shell or radiative-transfer override."
         OK = .false.
     end if
 
@@ -119,7 +142,7 @@
     class(TCAMBdata), target :: State
     logical, intent(in), optional :: WantTSpin
     integer :: i, label
-    real(dl), dimension(5) :: runpars
+    real(dl), dimension(21) :: runpars
     procedure(obj_function) :: dtauda
     real(dl) OmegaB, OmegaC, OmegaK, h2
     real(dl), allocatable :: Hz(:), zrec(:), tmrec(:), xrec(:), tmp(:)
@@ -149,10 +172,27 @@
 
         allocate(Hz(Nz), zrec(Nz), xrec(Nz), tmrec(Nz), tmp(Nz))
 
-        ! Set runtime parameters
-        runpars = 0._dl
+        ! Set runtime parameters using the CosmoRec.vX batch layout. The first 15 entries
+        ! are the native vX API; the final entries are CAMB-specific overrides.
+        runpars = -1._dl
         runpars(1) = this%fdm ! Set dark matter annihilation efficiency
         runpars(2) = this%accuracy
+        runpars(3) = 0._dl ! Do not write CosmoRec outputs
+        runpars(4) = 0._dl ! Use default A2s1s
+        runpars(5) = 0._dl ! B0: no magnetic-field heating
+        runpars(6) = -1._dl ! nB placeholder
+        runpars(7) = 2._dl ! PMF mode placeholder; irrelevant for B0=0
+        runpars(8) = 1._dl ! fine-structure constant scaling
+        runpars(9) = 1._dl ! electron-mass scaling
+        runpars(10) = 0._dl ! redshift-dependent scaling
+        runpars(11) = 6._dl ! native vX rescaling mode placeholder
+        runpars(12:15) = 0._dl ! Farhang et al. PCA terms
+        runpars(16) = this%diff_iteration_max
+        runpars(17) = this%n_shells
+        runpars(18) = this%n_shells_hei
+        runpars(19) = this%flag_hi_absorption
+        runpars(20) = this%n_s_2gamma
+        runpars(21) = this%n_s_raman
 
         ! Set redshifts to calculate at.
         do i=1,Nz

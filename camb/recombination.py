@@ -172,8 +172,42 @@ class CosmoRec(RecombinationModel):
             "Default 0, with diffusion; 1: without diffusion; 2: RECFAST++, 3: RECFAST++ run with correction",
         ),
         ("fdm", c_double, "Dark matter annihilation efficiency"),
-        ("accuracy", c_double, "0-normal, 3-most accurate"),
+        ("accuracy", c_double, "CosmoRec accuracy preset; see CosmoRec source for supported values"),
+        ("diff_iteration_max", c_int, "Override CosmoRec diffusion iteration count; negative uses batch default (2)"),
+        ("n_shells", c_int, "Override CosmoRec hydrogen shells; negative uses selected accuracy preset"),
+        ("n_shells_hei", c_int, "Override CosmoRec helium shells; negative uses selected accuracy preset"),
+        ("flag_hi_absorption", c_int, "Override CosmoRec HI absorption flag; negative uses selected accuracy preset"),
+        ("n_s_2gamma", c_int, "Override CosmoRec two-photon shell limit; negative uses selected accuracy preset"),
+        ("n_s_raman", c_int, "Override CosmoRec Raman shell limit; negative uses selected accuracy preset"),
     )
+
+    def write_ini(self, state) -> None:
+        super().write_ini(state)
+        state.write_fields(
+            self,
+            names=(
+                "runmode",
+                "accuracy",
+                "fdm",
+                "diff_iteration_max",
+                "n_shells",
+                "n_shells_hei",
+                "flag_hi_absorption",
+                "n_s_2gamma",
+                "n_s_raman",
+            ),
+            rename={
+                "runmode": "cosmorec_runmode",
+                "accuracy": "cosmorec_accuracy",
+                "fdm": "cosmorec_fdm",
+                "diff_iteration_max": "cosmorec_diff_iteration_max",
+                "n_shells": "cosmorec_n_shells",
+                "n_shells_hei": "cosmorec_n_shells_hei",
+                "flag_hi_absorption": "cosmorec_flag_hi_absorption",
+                "n_s_2gamma": "cosmorec_n_s_2gamma",
+                "n_s_raman": "cosmorec_n_s_raman",
+            },
+        )
 
 
 @optional_fortran_class
