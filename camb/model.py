@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import ctypes
 import logging
 from ctypes import POINTER, byref, c_bool, c_double, c_int, c_void_p
@@ -33,8 +31,6 @@ from .reionization import ReionizationModel
 from .sources import SourceWindow
 
 logger = logging.getLogger(__name__)
-
-# Union and Optional types are now built-in to Python 3.10+
 
 max_nu = 5
 max_transfer_redshifts = 256
@@ -189,6 +185,11 @@ class AccuracyParams(CAMB_Structure):
             c_double,
             "Number of time steps for background thermal history and source window interpolation",
         ),
+        (
+            "TimeSwitchBoost",
+            c_double,
+            "Accuracy for limit/domination approximation switches",
+        ),
         ("IntTolBoost", c_double, "Tolerances for integrating differential equations"),
         ("SourcekAccuracyBoost", c_double, "Accuracy of k sampling for source time integration"),
         ("IntkAccuracyBoost", c_double, "Accuracy of k sampling for integration"),
@@ -299,6 +300,13 @@ class CAMBparams(F2003Class):
         ("min_l", c_int, "l_min for the scalar C_L (1 or 2, L=1 dipoles are Newtonian Gauge)"),
         ("max_l", c_int, "l_max for the scalar C_L"),
         ("max_l_tensor", c_int, "l_max for the tensor C_L"),
+        (
+            "lens_output_margin",
+            c_int,
+            "Number of L below max_l down to which lensed C_L are guaranteed to be output; "
+            "the unlensed C_L used in the lensing convolution is treated as reliable to "
+            "max_l - (lens_output_margin - 50), so this also sets the lensed convolution margin.",
+        ),
         ("max_eta_k", c_double, "Maximum k*eta_0 for scalar C_L, where eta_0 is the conformal time today"),
         ("max_eta_k_tensor", c_double, "Maximum k*eta_0 for tensor C_L, where eta_0 is the conformal time today"),
         ("ombh2", c_double, "Omega_baryon h^2"),
@@ -643,10 +651,10 @@ class CAMBparams(F2003Class):
 
         Instead of setting the Hubble parameter directly, you can instead set the acoustic scale parameter
         (cosmomc_theta, which is based on a fitting formula for simple models, or thetastar, which is numerically
-        calculated more generally). Note that you must have already set the dark energy model, you can't use
-        set_cosmology with theta and then change the background evolution (which would change theta at the calculated
-        H0 value). Likewise, the dark energy model cannot depend explicitly on H0 unless you provide a custom
-        setter_H0 function to update the model for each H0 iteration used to search for thetastar.
+        calculated more generally). Note that you must have already set the dark energy and recombination model,
+        you can't use set_cosmology with theta and then change the background evolution (which would change theta
+        at the calculated H0 value). Likewise, the dark energy model cannot depend explicitly on H0 unless you provide
+        a custom setter_H0 function to update the model for each H0 iteration used to search for thetastar.
 
         If in doubt, print CAMBparams after setting parameters to see the underlying values that have been set.
 
@@ -984,8 +992,8 @@ class CAMBparams(F2003Class):
         self,
         lmax,
         max_eta_k=None,
-        lens_potential_accuracy=0,
-        lens_margin=150,
+        lens_potential_accuracy=None,
+        lens_output_margin=200,
         k_eta_fac=2.5,
         lens_k_eta_reference=18000.0,
         nonlinear=None,
@@ -999,10 +1007,15 @@ class CAMBparams(F2003Class):
         :param lmax: :math:`\ell_{\rm max}` you want
         :param max_eta_k: maximum value of :math:`k \eta_0\approx k\chi_*` to use, which indirectly sets k_max.
                           If None, sensible value set automatically.
-        :param lens_potential_accuracy: Set to 1 or higher if you want to get the lensing potential accurate
-                                        (1 is only Planck-level accuracy)
-        :param lens_margin: the :math:`\Delta \ell_{\rm max}` to use to ensure lensed :math:`C_\ell` are correct
-                            at :math:`\ell_{\rm max}`
+        :param lens_potential_accuracy: Set to 1 or higher to manually set lensing potential accuracy, or 0 to
+                                        reproduce the previous low-accuracy default. If None, use an automatic
+                                        high-accuracy default of ``max(4, (lmax - 1500) / 500)``. The floor of 4
+                                        is set by lensing-potential convergence (the lensed CMB needs less); both
+                                        are within check_accuracy tolerances.
+        :param lens_output_margin: the :math:`\Delta \ell_{\rm max}` margin added to ``max_l`` when ``DoLensing``
+                                   is true, so that the lensed :math:`C_\ell` output reaches the requested
+                                   :math:`\ell_{\rm max}`. Also written to ``pars.lens_output_margin`` so the
+                                   Fortran lensing code uses the matching floor.
         :param k_eta_fac:  k_eta_fac default factor for setting max_eta_k = k_eta_fac*lmax if max_eta_k=None
         :param lens_k_eta_reference:  value of max_eta_k to use when lens_potential_accuracy>0; use
                                       k_eta_max = lens_k_eta_reference*lens_potential_accuracy
@@ -1010,11 +1023,14 @@ class CAMBparams(F2003Class):
                           preserves current setting
         :return: self
         """
+        self.lens_output_margin = lens_output_margin
         if self.DoLensing:
-            self.max_l = lmax + lens_margin
+            self.max_l = lmax + lens_output_margin
         else:
             self.max_l = lmax
         self.max_eta_k = max_eta_k or self.max_l * k_eta_fac
+        if lens_potential_accuracy is None:
+            lens_potential_accuracy = max(4.0, (lmax - 1500.0) / 500.0)
         if lens_potential_accuracy:
             self.set_nonlinear_lensing(nonlinear is not False)
             self.max_eta_k = max(self.max_eta_k, lens_k_eta_reference * lens_potential_accuracy)

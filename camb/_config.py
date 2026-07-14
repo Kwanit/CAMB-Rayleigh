@@ -6,11 +6,27 @@ from .baseconfig import CAMBError, import_property
 lensing_method_curv_corr = 1
 lensing_method_flat_corr = 2
 lensing_method_harmonic = 3
+lensing_method_curv_corr_full = 4
+lensing_method_optimized = 5
 
 
 class _config:
     # print feedback if > 0 (note in Jupyter notebook this will appear in the terminal, not the notebook)
     FeedbackLevel = import_property(c_int, "config", "FeedbackLevel")
+
+    # if True, the Fortran code prints warnings (e.g. low-resolution, narrow window, parameter sanity checks)
+    print_fortran_warnings = import_property(c_bool, "config", "print_fortran_warnings")
+
+    # enable targeted accuracy improvements if > 0, AccuracyTarget being SO-like.
+    AccuracyTarget = import_property(c_int, "config", "AccuracyTarget")
+
+    enable_do_near_flat_integration = import_property(c_bool, "config", "enable_do_near_flat_integration")
+
+    enable_near_flat_smallchi_integration = import_property(c_bool, "config", "enable_near_flat_smallchi_integration")
+
+    enable_shifted_nu_scalar_approx = import_property(c_bool, "config", "enable_shifted_nu_scalar_approx")
+
+    enable_olver_source_integration = import_property(c_bool, "config", "enable_olver_source_integration")
 
     # print additional timing and progress (when FeedbackLevel>0)
     DebugMsgs = import_property(c_bool, "config", "DebugMsgs")
