@@ -15,10 +15,13 @@ pip install -e .[dev]
 ### 2. Install Pre-commit Hooks
 
 ```bash
-pre-commit install
+git config core.hooksPath .githooks
 ```
 
-This will automatically format your code and check for issues before each commit.
+The repository ships a portable `.githooks/pre-commit` wrapper that looks for `pre-commit` in the CAMB devcontainer
+environment first, then in the current checkout's `.venv`, then in the main checkout's `.venv` when you are committing
+from a linked worktree, then on your `PATH`. This keeps the same checkout working on a Linux devcontainer and a Windows
+host without rewriting the hook each time you switch environments.
 
 ### 3. Code Formatting Standards
 
@@ -26,16 +29,16 @@ CAMB uses [Ruff](https://docs.astral.sh/ruff/) for Python formatting and linting
 
 - **Line length**: 120 characters
 - **Quote style**: Double quotes
-- **Python version**: 3.10+
+- **Python version**: 3.11+
 - **Import sorting**: Automatic via ruff
-- **Target version**: py310
+- **Target version**: py311
 
 The pre-commit hooks include:
 
 - **Ruff formatting and linting** (Python files)
 - **Trailing whitespace removal** (Python, Fortran, Jupyter notebooks)
 - **End-of-file fixing** (Python, Fortran, Jupyter notebooks)
-- **PyUpgrade** for Python 3.10+ syntax
+- **PyUpgrade** for Python 3.11+ syntax
 
 ### 4. Before Committing
 
@@ -59,6 +62,14 @@ Run the test suite to ensure your changes don't break anything:
 ```bash
 python -m unittest camb.tests.camb_test
 ```
+
+To run the full suite including the slower symbolic and emission-angle tests:
+
+```bash
+python -m unittest camb.tests.camb_test camb.tests.camb_test_slow
+```
+
+The GitHub workflows include `camb.tests.camb_test_slow` by default, and skip it when `CAMB_TEST_FAST` is set.
 
 For HMcode tests (Linux only):
 
@@ -85,6 +96,9 @@ The following extensions will be suggested when you open the project:
 - `ms-python.debugpy` - Python debugging
 - `charliermarsh.ruff` - Ruff formatter and linter
 - `fortran-lang.linter-gfortran` - Fortran support
+
+The committed workspace settings only help VS Code discover a local `./.venv`; the devcontainer sets its
+container-local interpreter separately, so host and container environments do not fight each other.
 
 ### Optional Fortran Tools
 
