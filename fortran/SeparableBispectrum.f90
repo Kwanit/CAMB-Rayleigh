@@ -17,7 +17,7 @@
     module Bispectrum
     use results
     use InitialPower
-    use FlatBessels
+    use SpherBessels
     use constants
     use MpiUtils
     use splines
