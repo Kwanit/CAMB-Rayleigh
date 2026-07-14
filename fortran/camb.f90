@@ -909,7 +909,7 @@
     end subroutine CAMB_GetVersion
 
     subroutine CAMB_FreeGlobalMemory()
-    use SpherBessels
+    use FlatBessels
     use CAMBmain
     call Bessels_Free()
     !flat sky lensing also allocates bessels, but not normally used.

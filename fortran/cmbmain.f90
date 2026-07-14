@@ -55,7 +55,7 @@
     use precision
     use results
     use GaugeInterface
-    use SpherBessels
+    use FlatBessels
     use MassiveNu
     use InitialPower
     use SourceWindows
@@ -101,6 +101,8 @@
     real(dl) :: maximum_qeta = 3000._dl
 
     integer :: l_smooth_sample = 3000 !assume transfer functions effectively small for k*chi0>2*l_smooth_sample
+
+    real(dl), parameter :: xlimmin=35._dl, xlimfrac = 0.05_dl
 
     integer :: max_bessels_l_index  = 1000000
     real(dl) :: max_bessels_etak = 1000000*2
@@ -1666,7 +1668,7 @@
     !non-flat source integration
 
     subroutine IntegrateSourcesBessels(IV,ThisCT,j,l,nu)
-    use SpherBessels
+    use FlatBessels
     type(IntegrationVars) IV
     Type(ClTransferData) :: ThisCT
     logical DoInt

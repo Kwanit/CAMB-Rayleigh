@@ -17,11 +17,13 @@
     module Bispectrum
     use results
     use InitialPower
-    use SpherBessels
+    use FlatBessels
     use constants
     use MpiUtils
     use splines
     implicit none
+
+    real(dl), parameter :: xlimmin=35._dl, xlimfrac = 0.05_dl
 
     integer, parameter :: max_bispectrum_deltas = 5, max_bispectrum_fields=3
 
