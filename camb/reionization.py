@@ -6,11 +6,35 @@ from .baseconfig import F2003Class, f_pointer, fortran_class
 class ReionizationModel(F2003Class):
     """
     Abstract base class for reionization models.
+
+    The optional ``include_heating`` switch adds an approximate model of the photo-heating of the
+    intergalactic medium during reionization. It is a very crude instantaneous-Jeans approximation for
+    an order of magnitude estimate. When enabled, the baryon temperature is smoothly raised
+    towards ``reion_temperature`` (default :math:`10^4` K) following the ionization-fraction shape, and the
+    baryon sound speed is mapped towards the corresponding ideal-gas value. This raises the baryon pressure,
+    suppressing small-scale baryon (and hence total matter) power. It is off by default and only affects the
+    low-redshift matter power spectrum.
+
     """
 
     _fields_ = (
         ("Reionization", c_bool, "Is there reionization? (can be off for matter power, which is independent of it)"),
+        (
+            "include_heating",
+            c_bool,
+            "Whether to include approximate smooth reionization heating following the x_e shape (default False)",
+        ),
+        (
+            "reion_temperature",
+            c_double,
+            "Asymptotic gas temperature in K reached during reionization heating (default 1e4 K)",
+        ),
     )
+
+    def write_ini(self, state) -> None:
+        state.set("reionization", self.Reionization)
+        state.set("reion_include_heating", self.include_heating)
+        state.set("reion_temperature", self.reion_temperature)
 
 
 class BaseTauWithHeReionization(ReionizationModel):
@@ -96,6 +120,20 @@ class BaseTauWithHeReionization(ReionizationModel):
         if max_zrei is not None:
             self.max_redshift = max_zrei
 
+    def write_ini(self, state) -> None:
+        super().write_ini(state)
+        state.set("re_use_optical_depth", self.use_optical_depth)
+        if self.use_optical_depth:
+            state.set("re_optical_depth", self.optical_depth)
+        else:
+            state.set("re_redshift", self.redshift)
+        state.set("re_ionization_frac", self.fraction)
+        state.set("include_helium_fullreion", self.include_helium_fullreion)
+        state.set("re_helium_redshift", self.helium_redshift)
+        state.set("re_helium_delta_redshift", self.helium_delta_redshift)
+        state.set("re_helium_redshiftstart", self.helium_redshiftstart)
+        state.set("max_zrei", self.max_redshift)
+
 
 @fortran_class
 class TanhReionization(BaseTauWithHeReionization):
@@ -118,6 +156,10 @@ class TanhReionization(BaseTauWithHeReionization):
         super().set_extra_params(max_zrei)
         if deltazrei is not None:
             self.delta_redshift = deltazrei
+
+    def write_ini(self, state) -> None:
+        super().write_ini(state)
+        state.set("re_delta_redshift", self.delta_redshift)
 
 
 @fortran_class
@@ -154,3 +196,7 @@ class ExpReionization(BaseTauWithHeReionization):
             self.reion_exp_power = reion_exp_power
         if reion_exp_smooth_width is not None:
             self.reion_exp_smooth_width = reion_exp_smooth_width
+
+    def write_ini(self, state) -> None:
+        super().write_ini(state)
+        state.write_fields(self, names=("reion_redshift_complete", "reion_exp_power", "reion_exp_smooth_width"))
