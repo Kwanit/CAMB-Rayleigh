@@ -29,8 +29,198 @@ def chi_squared(covinv, x):
 
 
 int_arg = POINTER(c_int)
+double_arg = POINTER(c_double)
 _3j = camblib.__mathutils_MOD_getthreejs
 _3j.argtypes = [numpy_1d, int_arg, int_arg, int_arg, int_arg]
+
+_phi_olver = camblib.camb_getphiolver
+_phi_olver.argtypes = [c_int, c_int, c_double, c_double]
+_phi_olver.restype = c_double
+
+_phi_olver_array = camblib.camb_getphiolverarray
+_phi_olver_array.argtypes = [numpy_1d, c_int, c_int, c_double, numpy_1d, c_int]
+
+_phi_recurs = camblib.camb_getphirecurs
+_phi_recurs.argtypes = [c_int, c_int, c_double, c_double]
+_phi_recurs.restype = c_double
+
+_phi_recurs_array = camblib.camb_getphirecursarray
+_phi_recurs_array.argtypes = [numpy_1d, c_int, c_int, c_double, numpy_1d, c_int]
+
+_phi_derivative = camblib.camb_getphiderivative
+_phi_derivative.argtypes = [c_int, c_int, c_double, c_double]
+_phi_derivative.restype = c_double
+
+_phi_first_peak_chi = camblib.camb_getphifirstpeakchi
+_phi_first_peak_chi.argtypes = [c_int, c_int, c_double]
+_phi_first_peak_chi.restype = c_double
+
+_phi_first_peak_no_peak_found = camblib.camb_getphifirstpeaknopeakfound
+_phi_first_peak_no_peak_found.argtypes = [c_int, c_int, c_double]
+_phi_first_peak_no_peak_found.restype = c_int
+
+_phi_first_peak_amplitude = camblib.camb_getphifirstpeakamplitude
+_phi_first_peak_amplitude.argtypes = [c_int, c_int, c_double]
+_phi_first_peak_amplitude.restype = c_double
+
+_airy_ai_fast_array = camblib.__mathutils_MOD_airyaifastarray
+_airy_ai_fast_array.argtypes = [numpy_1d, numpy_1d, int_arg]
+
+_airy_fast_array = camblib.__mathutils_MOD_airyfastarray
+_airy_fast_array.argtypes = [numpy_1d, numpy_1d, numpy_1d, int_arg]
+
+
+def airy_ai_fast(x):
+    """
+    Fast Airy :math:`Ai(x)` approximation.
+
+    Uses a fitted Fortran implementation optimized for < 1e-7 absolute accuracy.
+
+    :param x: scalar or array-like input values
+    :return: Airy :math:`Ai(x)`, with scalar or array shape matching ``x``
+    """
+    x_array = np.asarray(x, dtype=np.float64)
+    flat = np.ascontiguousarray(x_array.reshape(-1))
+    result = np.empty_like(flat)
+    _airy_ai_fast_array(result, flat, c_int(flat.size))
+    if x_array.ndim == 0:
+        return result.item()
+    return result.reshape(x_array.shape)
+
+
+def airy_fast(x):
+    """
+    Fast Airy :math:`Ai(x)` and derivative :math:`Ai'(x)` approximation.
+
+    Uses a fitted Fortran implementation optimized for < 1e-7 absolute accuracy.
+
+    :param x: scalar or array-like input values
+    :return: tuple ``(ai, aip)`` for Airy :math:`Ai(x)` and :math:`Ai'(x)`, with scalar or array shapes matching ``x``
+    """
+    x_array = np.asarray(x, dtype=np.float64)
+    flat = np.ascontiguousarray(x_array.reshape(-1))
+    ai = np.empty_like(flat)
+    aip = np.empty_like(flat)
+    _airy_fast_array(ai, aip, flat, c_int(flat.size))
+    if x_array.ndim == 0:
+        return ai.item(), aip.item()
+    return ai.reshape(x_array.shape), aip.reshape(x_array.shape)
+
+
+def _hyperspherical_bessel_dispatch(function, vector_function, L, K, nu, chi):
+    _validate_hyperspherical_bessel_inputs(L, K, nu)
+    chi_array = np.asarray(chi, dtype=np.float64)
+    if np.any(chi_array < 0):
+        raise ValueError("chi must be non-negative")
+    nu_in = c_double(nu)
+
+    if chi_array.ndim == 0:
+        return function(c_int(L), c_int(K), nu_in, c_double(float(chi_array)))
+
+    if chi_array.ndim != 1:
+        raise ValueError("chi must be a scalar or 1D array")
+
+    chi_array = np.ascontiguousarray(chi_array)
+    result = np.empty_like(chi_array)
+    vector_function(result, c_int(L), c_int(K), nu_in, chi_array, c_int(len(chi_array)))
+    return result
+
+
+def _validate_hyperspherical_bessel_inputs(L, K, nu):
+    if L < 0:
+        raise ValueError("Bessel function index L must be non-negative")
+    if K not in (-1, 0, 1):
+        raise ValueError("K must be one of -1, 0 or 1")
+    if nu < 0:
+        raise ValueError("nu must be non-negative")
+    if K == 1:
+        inu = round(nu)
+        if abs(nu - inu) > 100 * np.finfo(float).eps * max(1.0, abs(nu)):
+            raise ValueError("nu must be an integer mode for K=1")
+        if inu < 3:
+            raise ValueError("nu must be >= 3 for K=1")
+        if inu <= L:
+            raise ValueError("nu must be > L for K=1")
+
+
+def phi_olver(L, K, nu, chi):
+    r"""
+    Evaluate the regular hyperspherical Bessel function :math:`\phi_L^\nu(K,\chi)` using the
+    leading-order Olver map to a flat spherical Bessel function.
+
+    Fast with peak-relative accuracy around 1e-4; use :func:`phi_recurs` for a slower high-accuracy reference.
+    For ``K=0`` this returns the spherical Bessel function :math:`j_L(\nu\chi)`.
+    Falls back to the recursive result where the Olver approximation may be unreliable.
+
+    :param L: multipole index
+    :param K: dimensionless curvature sign, one of -1, 0, 1
+    :param nu: dimensionless radial eigenvalue; for closed models (``K=1``), an integer mode with ``nu >= 3``
+        and ``nu > L``
+    :param chi: non-negative scalar dimensionless radial distance or 1D array of non-negative values
+    :return: scalar value or 1D array matching chi
+    """
+
+    return _hyperspherical_bessel_dispatch(_phi_olver, _phi_olver_array, L, K, nu, chi)
+
+
+def phi_recurs(L, K, nu, chi):
+    r"""
+    Evaluate the regular hyperspherical Bessel function :math:`\phi_L^\nu(K,\chi)` by recurrence.
+
+    Uses upward recurrence in the safe oscillatory region and Miller backward recurrence elsewhere,
+    normalized by the exact low-order solution. The recurrence follows Abbott and Schaefer (1986)
+    for the seed and recurrence formulae. Miller starts use the continued-fraction construction of
+    Tram (2017) and Lesgourgues and Tram (2014) for ``K=0,-1``; for ``K=1`` they use either the
+    finite closed-spectrum endpoint or the closed-space Gegenbauer Miller start.
+
+    :param L: multipole index
+    :param K: dimensionless curvature sign, one of -1, 0, 1
+    :param nu: dimensionless radial eigenvalue; for closed models (``K=1``), an integer mode with ``nu >= 3``
+        and ``nu > L``
+    :param chi: non-negative scalar dimensionless radial distance or 1D array of non-negative values
+    :return: scalar value or 1D array matching chi
+    """
+
+    return _hyperspherical_bessel_dispatch(_phi_recurs, _phi_recurs_array, L, K, nu, chi)
+
+
+def phi_derivative(L, K, nu, chi):
+    r"""
+    Evaluate ``d phi_L^nu(K, chi) / d chi`` using the adjacent-order recurrence.
+    """
+
+    _validate_hyperspherical_bessel_inputs(L, K, nu)
+    if chi < 0:
+        raise ValueError("chi must be non-negative")
+    return _phi_derivative(c_int(L), c_int(K), c_double(nu), c_double(chi))
+
+
+def phi_first_peak_chi(L, K, nu, return_status=False):
+    r"""
+    Return the first peak position at or after the hyperspherical Bessel turning point.
+
+    If ``return_status`` is true, also return whether no stationary peak was found before
+    the search boundary, in which case the returned position is that boundary.
+    """
+
+    _validate_hyperspherical_bessel_inputs(L, K, nu)
+    chi = _phi_first_peak_chi(c_int(L), c_int(K), c_double(nu))
+    if return_status:
+        no_peak_found = bool(_phi_first_peak_no_peak_found(c_int(L), c_int(K), c_double(nu)))
+        return chi, no_peak_found
+    return chi
+
+
+def phi_first_peak_amplitude(L, K, nu):
+    r"""
+    Return ``abs(phi_recurs(L, K, nu, phi_first_peak_chi(L, K, nu)))``.
+
+    If ``phi_first_peak_chi(..., return_status=True)`` reports no peak found, this is the
+    amplitude at the search boundary rather than at a stationary point.
+    """
+
+    _validate_hyperspherical_bessel_inputs(L, K, nu)
+    return _phi_first_peak_amplitude(c_int(L), c_int(K), c_double(nu))
 
 
 def threej(l2, l3, m2, m3):
@@ -74,7 +264,14 @@ def threej_pt(l1, l2, l3, m1, m2, m3):
 
 # Utils_3j_integrate(W,lmax_w, n, dopol, M, lmax)
 _coupling_3j = camblib.__mathutils_MOD_integrate_3j
-_coupling_3j.argtypes = [numpy_2d, POINTER(c_int), POINTER(c_int), POINTER(c_bool), numpy_3d, POINTER(c_int)]
+_coupling_3j.argtypes = [
+    numpy_2d,
+    POINTER(c_int),
+    POINTER(c_int),
+    POINTER(c_bool),
+    numpy_3d,
+    POINTER(c_int),
+]
 
 
 def threej_coupling(W, lmax, pol=False):
@@ -179,3 +376,25 @@ _gauss_legendre.argtypes = [numpy_1d, numpy_1d, int_arg]
 
 def gauss_legendre(xvals, weights, npoints):
     _gauss_legendre(xvals, weights, c_int(npoints))
+
+
+_legendre_table = camblib.__mathutils_MOD_legendre_table
+_legendre_table.argtypes = [numpy_1d, numpy_2d, numpy_2d, int_arg, int_arg]
+
+
+def legendre_polynomials(x, lmax):
+    """
+    Legendre polynomials :math:`P_\\ell(x)` and derivatives :math:`dP_\\ell/dx` for all
+    :math:`0\\le \\ell \\le` lmax (requires :math:`|x| < 1`).
+
+    :param x: scalar or 1D array of x values
+    :param lmax: maximum :math:`\\ell`
+    :return: P, dP arrays; shape (lmax+1,) for scalar x, else (len(x), lmax+1)
+    """
+    xarr = np.ascontiguousarray(np.atleast_1d(x), dtype=np.float64)
+    P = np.empty((len(xarr), lmax + 1))
+    dP = np.empty((len(xarr), lmax + 1))
+    _legendre_table(xarr, P, dP, c_int(lmax), c_int(len(xarr)))
+    if np.ndim(x) == 0:
+        return P[0], dP[0]
+    return P, dP
