@@ -57,7 +57,6 @@
     use Interpolation, only : cubic_spline_second_derivs
     use GaugeInterface
     use HypersphericalBesselOlver, only: u_olver, phi_olver
-    use RungeKuttaDP45Module, only : RungeKuttaDP45Settings
     use SpherBessels
     use MassiveNu
     use InitialPower

@@ -5,7 +5,7 @@ import os
 from ctypes import POINTER, byref, c_bool, c_double
 from inspect import FullArgSpec, getfullargspec
 
-from . import constants, model
+from . import constants, model, recombination
 from ._config import config
 from .baseconfig import CAMBError as CAMBError
 from .baseconfig import CAMBUnknownArgumentError, CAMBValueError, camblib, filepath_to_fortran, np
@@ -53,6 +53,22 @@ def get_results(params):
         print(params)
     res.calc_power_spectra(params)
     return res
+
+
+def get_bispectrum(params, bispectrum_params=None, output_root=""):
+    """
+    Calculate local primordial and/or CMB lensing bispectrum outputs.
+
+    :param params: :class:`.model.CAMBparams` instance
+    :param bispectrum_params: optional :class:`.bispectrum.BispectrumParams` instance or dict
+    :param output_root: filename prefix for requested large file outputs
+    :return: :class:`.bispectrum.BispectrumResult`
+    """
+    if isinstance(params, dict):
+        params = set_params(**params)
+    from .bispectrum import get_bispectrum as _get_bispectrum
+
+    return _get_bispectrum(params, bispectrum_params, output_root=output_root, _debug_params=_debug_params)
 
 
 def get_transfer_functions(params, only_time_sources=False):
@@ -145,6 +161,7 @@ def set_params(cp=None, verbose=False, **params):
 
     * :meth:`.model.CAMBparams.set_accuracy`
     * :meth:`.model.CAMBparams.set_classes`
+    * :meth:`.recombination.RecombinationModel.set_params` (or equivalent if a different recombination class used)
     * :meth:`.dark_energy.DarkEnergyEqnOfState.set_params` (or equivalent if a different dark energy model class used)
     * :meth:`.reionization.TanhReionization.set_extra_params` (or equivalent if a different reionization class used)
     * :meth:`.model.CAMBparams.set_cosmology`
@@ -182,6 +199,7 @@ def set_params(cp=None, verbose=False, **params):
     # set_classes allows redefinition of the classes used, so must be called before setting class parameters
     do_set(cp.set_accuracy)
     do_set(cp.set_classes)
+    do_set(cp.Recomb.set_params)
     do_set(cp.DarkEnergy.set_params)
     do_set(cp.Reion.set_extra_params)
     do_set(cp.set_cosmology)
@@ -280,7 +298,9 @@ def set_params_cosmomc(
     :param halofit_version: name of the specific Halofit model to use for non-linear modelling
     :param dark_energy_model: ppf or fluid dark energy model
     :param lmax: lmax for accuracy settings
-    :param lens_potential_accuracy: lensing accuracy parameter
+    :param lens_potential_accuracy: lensing accuracy parameter; defaults to the historical CosmoMC value of 1.
+                                    Set to None for the automatic high-accuracy default from
+                                    :meth:`.model.CAMBparams.set_for_lmax`
     :param inpars: optional input CAMBParams to set
     :return:
     """
@@ -288,6 +308,7 @@ def set_params_cosmomc(
     if p.get("alpha1", 0) or p.get("Aphiphi", 1) != 1:
         raise ValueError("Parameter not currently supported by set_params_cosmomc")
 
+    pars.Recomb.set_params(recfast_approx_model=recombination.recfast_planck)
     pars.set_dark_energy(w=p.get("w", -1), wa=p.get("wa", 0), dark_energy_model=dark_energy_model)
     pars.Reion.set_extra_params(deltazrei=p.get("deltazrei", None))
     pars.set_cosmology(
