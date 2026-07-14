@@ -9,16 +9,17 @@ repos:
         exclude_types:
           - python
       - id: check-added-large-files
+        exclude: ^docs/changelog/hyperspherical_bessels\.pdf$
       - id: check-merge-conflict
 
   - repo: https://github.com/asottile/pyupgrade
     rev: v3.21.2
     hooks:
       - id: pyupgrade
-        args: [--py310-plus]
+        args: [--py311-plus]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.2
+    rev: v0.15.18
     hooks:
       - id: ruff-check
         args: [--fix, --exit-non-zero-on-fix]

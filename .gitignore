@@ -4,11 +4,13 @@
 *.o
 *.so
 *.sm
+*.json
 *~*
 .metadata
 .project
 .pydevproject
 x64/
+_build/
 Debug/
 Debuglib/
 Release/
@@ -23,6 +25,7 @@ WinDLL/
 *.user
 *.save
 *.log
+*.csv
 .idea
 .DS_Store
 *egg*
@@ -52,15 +55,27 @@ testfile*
 *~
 *.whl
 *.pdf
+!docs/changelog/flat_bessel_approximations.pdf
+!docs/changelog/hyperspherical_bessels.pdf
 .vs
+*.toc
+*.aux
+*.out
+*.fdb_latexmk
+*.fls
+*.blg
+*.bbl
 *.mp4
 *.exe
+*_tmp*
+*.npz
+*_old.*
+*_old/
 
 # Ignore all .dat and .ini files except those already tracked in git
 *.dat
 *.ini
 *compatibility.txt
-camb_test.py
 temp_test.py
 *.layout
 lensing_cgrads.f90
@@ -83,6 +98,15 @@ lensing_cgrads.f90
 prompts.txt
 
 scripts
+!.agents/skills/**/scripts/
+!.agents/skills/*/scripts/*.py
 uv.lock
 .venv
 __pycache__
+external/
+!.devcontainer/
+!.devcontainer/**
+.claude
+devcontainer-lock.json
+accuracy_plots/
+HMcode_test_outputs/
