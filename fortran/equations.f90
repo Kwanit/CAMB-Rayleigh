@@ -186,10 +186,17 @@
 
     real(dl), parameter :: ep0=1.0d-2
     integer, parameter :: lmaxnu_high_ktau=4 !Jan2015, increased from 3 to fix mpk for mnu~6eV
+    ! High-precision transfer functions for non-negligible massive neutrinos need
+    ! extra hierarchy depth only near the non-relativistic free-streaming turnover.
+    real(dl), parameter :: massive_nu_transfer_l_boost_mass = 600._dl
+    real(dl), parameter :: massive_nu_transfer_l_boost_ktau = 500._dl
+    real(dl), parameter :: massive_nu_transfer_l_extra_boost = 2.15_dl
+    real(dl), parameter :: massive_nu_cmb_l_extra_boost = 2.0_dl
+    real(dl), parameter :: massive_nu_transfer_switch_extra_boost = 2._dl
 
     real(dl) epsw
     real(dl), allocatable :: nu_tau_notmassless(:,:)
-    real(dl) nu_tau_nonrelativistic(max_nu), nu_tau_massive(max_nu)
+    real(dl) nu_tau_nonrelativistic_physical(max_nu), nu_tau_nonrelativistic(max_nu), nu_tau_massive(max_nu)
 
     procedure(state_function), private :: dtauda
     contains
@@ -494,6 +501,35 @@
     end if
     end function DeltaTimeMaxed
 
+    function MassiveNuTransferLAccuracyBoost(nu_mass, q, tau_nonrelativistic_physical) result(boost)
+    real(dl), intent(in) :: nu_mass
+    real(dl), intent(in) :: q
+    real(dl), intent(in) :: tau_nonrelativistic_physical
+    real(dl) boost
+
+    boost = CP%Accuracy%lAccuracyBoost
+    if (AccuracyTarget > 0 .and. nu_mass > massive_nu_transfer_l_boost_mass &
+        .and. q*tau_nonrelativistic_physical < massive_nu_transfer_l_boost_ktau) then
+        if (CP%WantTransfer .and. CP%Transfer%high_precision) then
+            boost = boost * massive_nu_transfer_l_extra_boost
+        else
+            boost = boost * massive_nu_cmb_l_extra_boost
+        end if
+    end if
+
+    end function MassiveNuTransferLAccuracyBoost
+
+    function MassiveNuTransferSwitchBoost(nu_mass) result(boost)
+    real(dl), intent(in) :: nu_mass
+    real(dl) boost
+
+    boost = CP%Accuracy%AccuracyBoost*CP%Accuracy%TimeSwitchBoost
+    if (AccuracyTarget > 0 .and. nu_mass > massive_nu_transfer_l_boost_mass &
+        .and. ((CP%WantTransfer .and. CP%Transfer%high_precision) .or. CP%WantCls)) &
+        boost = boost * massive_nu_transfer_switch_extra_boost
+
+    end function MassiveNuTransferSwitchBoost
+
     subroutine GaugeInterface_Init
     !Precompute various arrays and other things independent of wavenumber
     integer j, nu_i
@@ -533,9 +569,11 @@
                     nu_tau_notmassless(j, nu_i) = time
                 end do
 
-                a_nonrel =  2.5d0/nu_mass*CP%Accuracy%AccuracyBoost
+                a_nonrel =  2.5d0/nu_mass
+                nu_tau_nonrelativistic_physical(nu_i) = DeltaTimeMaxed(0._dl,a_nonrel)
+                a_nonrel = a_nonrel*MassiveNuTransferSwitchBoost(nu_mass)
                 nu_tau_nonrelativistic(nu_i) =DeltaTimeMaxed(0._dl,a_nonrel)
-                a_massive =  17.d0/nu_mass*CP%Accuracy%AccuracyBoost
+                a_massive =  17.d0/nu_mass*MassiveNuTransferSwitchBoost(nu_mass)
                 nu_tau_massive(nu_i) =nu_tau_nonrelativistic(nu_i) + DeltaTimeMaxed(a_nonrel,a_massive)
             end do
         end associate
@@ -551,6 +589,7 @@
     type(EvolutionVars) EV
     integer, intent(out), optional :: max_num_eqns
     integer neq, maxeq, nu_i
+    real(dl) nu_l_accuracy_boost
 
     neq=basic_num_eqns
     maxeq=neq
@@ -627,15 +666,16 @@
         end if
 
         do nu_i=1, CP%Nu_Mass_eigenstates
+            nu_l_accuracy_boost = MassiveNuTransferLAccuracyBoost(State%nu_masses(nu_i), EV%q, &
+                nu_tau_nonrelativistic_physical(nu_i))
             if (EV%high_ktau_neutrino_approx) then
-                EV%lmaxnu_tau(nu_i) = int(lmaxnu_high_ktau *CP%Accuracy%lAccuracyBoost)
+                EV%lmaxnu_tau(nu_i) = int(lmaxnu_high_ktau *nu_l_accuracy_boost)
                 if (CP%Transfer%accurate_massive_neutrinos) EV%lmaxnu_tau(nu_i) = EV%lmaxnu_tau(nu_i) *3
             else
                 EV%lmaxnu_tau(nu_i) =max(min(nint(0.8_dl*EV%q*nu_tau_nonrelativistic(nu_i) &
-                    *CP%Accuracy%lAccuracyBoost),EV%lmaxnu),3)
-                !!!Feb13tweak
+                    *nu_l_accuracy_boost),EV%lmaxnu),3)
                 if (EV%nu_nonrelativistic(nu_i)) EV%lmaxnu_tau(nu_i)= &
-                    min(EV%lmaxnu_tau(nu_i),nint(4*CP%Accuracy%lAccuracyBoost))
+                    min(EV%lmaxnu_tau(nu_i),nint(4*nu_l_accuracy_boost))
             end if
             if (State%nu_masses(nu_i) > 5000 .and. CP%Transfer%high_precision) &
                 EV%lmaxnu_tau(nu_i) = EV%lmaxnu_tau(nu_i)*2 !megadamping
@@ -822,8 +862,11 @@
     use MassiveNu
     !Set the numer of equations in each hierarchy, and get total number of equations for this k
     type(EvolutionVars) EV
-    real(dl) scal, max_nu_mass
-    integer nu_i,q_rel,j
+    real(dl) scal, max_nu_mass, l_accuracy_boost, nu_l_accuracy_boost, transfer_lmaxnr
+    integer nu_i,q_rel,j, min_lmaxnr
+
+    l_accuracy_boost = CP%Accuracy%lAccuracyBoost
+    min_lmaxnr = max(3, nint(3*l_accuracy_boost))
 
     if (CP%Num_Nu_massive == 0) then
         EV%lmaxnu=0
@@ -853,10 +896,22 @@
         if (EV%NuMethod == Nu_Best) EV%NuMethod = Nu_Trunc
         !l_max for massive neutrinos
         if (CP%Transfer%high_precision) then
-            EV%lmaxnu=nint(25*CP%Accuracy%lAccuracyBoost)
+            EV%lmaxnu=nint(25*l_accuracy_boost)
+            do nu_i = 1, CP%Nu_mass_eigenstates
+                nu_l_accuracy_boost = MassiveNuTransferLAccuracyBoost(State%nu_masses(nu_i), EV%q, &
+                    nu_tau_nonrelativistic_physical(nu_i))
+                EV%lmaxnu = max(EV%lmaxnu, nint(25*nu_l_accuracy_boost))
+            end do
         else
-            EV%lmaxnu=max(3,nint(10*CP%Accuracy%lAccuracyBoost))
-            if (max_nu_mass>700) EV%lmaxnu=max(3,nint(15*CP%Accuracy%lAccuracyBoost)) !Feb13 tweak
+            EV%lmaxnu=max(3,nint(10*l_accuracy_boost))
+            if (max_nu_mass>700) EV%lmaxnu=max(3,nint(15*l_accuracy_boost)) !Feb13 tweak
+            do nu_i = 1, CP%Nu_mass_eigenstates
+                nu_l_accuracy_boost = MassiveNuTransferLAccuracyBoost(State%nu_masses(nu_i), EV%q, &
+                    nu_tau_nonrelativistic_physical(nu_i))
+                EV%lmaxnu = max(EV%lmaxnu, nint(10*nu_l_accuracy_boost))
+                if (State%nu_masses(nu_i)>700) &
+                    EV%lmaxnu = max(EV%lmaxnu, nint(15*nu_l_accuracy_boost))
+            end do
         endif
     end if
 
@@ -877,48 +932,72 @@
         EV%Evolve_TM = .false.
 
         if (CP%Accuracy%AccuratePolarization) then
-            EV%lmaxg  = max(nint(11*CP%Accuracy%lAccuracyBoost),3)
+            EV%lmaxg  = max(nint(11*l_accuracy_boost),3)
         else
-            EV%lmaxg  = max(nint(8*CP%Accuracy%lAccuracyBoost),3)
+            EV%lmaxg  = max(nint(8*l_accuracy_boost),3)
         end if
-        EV%lmaxnr = max(nint(14*CP%Accuracy%lAccuracyBoost),3)
-        if (max_nu_mass>700) EV%lmaxnr = max(nint(32*CP%Accuracy%lAccuracyBoost),3) !Feb13 tweak
+        EV%lmaxnr = max(nint(14*l_accuracy_boost),min_lmaxnr)
+        if (max_nu_mass>700) EV%lmaxnr = max(nint(32*l_accuracy_boost),min_lmaxnr) !Feb13 tweak
 
         EV%lmaxgpol = EV%lmaxg
-        if (.not.CP%Accuracy%AccuratePolarization) EV%lmaxgpol=max(nint(4*CP%Accuracy%lAccuracyBoost),3)
+        if (.not.CP%Accuracy%AccuratePolarization) then
+            EV%lmaxgpol=max(nint(4*l_accuracy_boost),3)
+        elseif (AccuracyTarget > 0 .and. CP%Want_CMB .and. EV%q > 0.15_dl) then
+            EV%lmaxg = max(EV%lmaxg, nint(13*l_accuracy_boost))
+            EV%lmaxgpol = max(EV%lmaxgpol, nint(14*l_accuracy_boost))
+        end if
 
         if (EV%q < 0.05) then
             !Large scales need fewer equations
             scal  = 1
             if (CP%Accuracy%AccuratePolarization) scal = 4  !But need more to get polarization right
-            EV%lmaxgpol=max(3,nint(min(8,nint(scal* 150* EV%q))*CP%Accuracy%lAccuracyBoost))
-            EV%lmaxnr=max(3,nint(min(7,nint(sqrt(scal)* 150 * EV%q))*CP%Accuracy%lAccuracyBoost))
-            if (EV%lmaxnr < EV%lmaxnu) then
-                ! Nov 2020 change following Pavel Motloch report
-                EV%lmaxnr = EV%lmaxnu
-                !EV%lmaxnu = min(EV%lmaxnu, EV%lmaxnr) ! may be better but have not tested and makes small result changes
-            endif
-            EV%lmaxg=max(3,nint(min(8,nint(sqrt(scal) *300 * EV%q))*CP%Accuracy%lAccuracyBoost))
+            EV%lmaxgpol=max(3,nint(min(8,nint(scal* 150* EV%q))*l_accuracy_boost))
+            EV%lmaxnr=max(min_lmaxnr,nint(min(8,nint(sqrt(scal)* 150 * EV%q))*l_accuracy_boost))
+            EV%lmaxg=max(3,nint(min(8,nint(sqrt(scal) *300 * EV%q))*l_accuracy_boost))
             !Sources
             if (CP%SourceTerms%line_phot_quadrupole) then
                 EV%lmaxg=EV%lmaxg*8
                 EV%lmaxgpol=EV%lmaxgpol*4
             elseif (CP%Accuracy%AccurateReionization) then
-                EV%lmaxg=EV%lmaxg*4
+                if (AccuracyTarget > 0) then
+                    EV%lmaxg=EV%lmaxg*8
+                else
+                    EV%lmaxg=EV%lmaxg*4
+                end if
                 EV%lmaxgpol=EV%lmaxgpol*2
             end if
         end if
 
         if (EV%TransferOnly) then
-            EV%lmaxgpol = min(EV%lmaxgpol,nint(5*CP%Accuracy%lAccuracyBoost))
-            EV%lmaxg = min(EV%lmaxg,nint(6*CP%Accuracy%lAccuracyBoost))
+            EV%lmaxgpol = min(EV%lmaxgpol,nint(5*l_accuracy_boost))
+            EV%lmaxg = min(EV%lmaxg,nint(6*l_accuracy_boost))
+        end if
+        if (AccuracyTarget > 0 .and. CP%WantTransfer .and. CP%Transfer%high_precision .and. &
+            EV%q > 0.03_dl .and. EV%q < 0.2_dl) then
+            EV%lmaxg = max(EV%lmaxg, nint(12*l_accuracy_boost))
+            EV%lmaxgpol = max(EV%lmaxgpol, nint(5*l_accuracy_boost))
         end if
         if (CP%Transfer%high_precision .or. CP%Do21cm) then
-            EV%lmaxnr=max(nint(45*CP%Accuracy%lAccuracyBoost),3)
+            ! Resolve the massless-neutrino hierarchy smoothly across transfer scales:
+            ! enough low-k hierarchy by equality scales, default depth by q=0.05, then the high-k target.
+            if (EV%q >= 0.005_dl) EV%lmaxnr = max(EV%lmaxnr, nint(4*l_accuracy_boost))
+            if (EV%q >= 0.010_dl .and. EV%q < 0.05_dl) then
+                transfer_lmaxnr = (8._dl + 6._dl*(EV%q - 0.010_dl)/0.040_dl)*l_accuracy_boost
+                EV%lmaxnr = max(EV%lmaxnr, nint(transfer_lmaxnr), min_lmaxnr)
+            elseif (EV%q >= 0.05_dl .and. EV%q < 0.12_dl) then
+                transfer_lmaxnr = (14._dl + 31._dl*(EV%q - 0.05_dl)/0.07_dl)*l_accuracy_boost
+                EV%lmaxnr = max(EV%lmaxnr, nint(transfer_lmaxnr), min_lmaxnr)
+            elseif (EV%q >= 0.12_dl) then
+                EV%lmaxnr=max(nint(45*l_accuracy_boost),min_lmaxnr)
+            end if
             if (EV%q > 0.04 .and. EV%q < 0.5) then !baryon oscillation scales
-                EV%lmaxg=max(EV%lmaxg,10)
+                EV%lmaxg=max(EV%lmaxg,nint(10*l_accuracy_boost))
             end if
         end if
+        if (EV%lmaxnr < EV%lmaxnu) then
+            ! Massive-neutrino relativistic corrections subtract the massless hierarchy up to lmaxnu_pert.
+            EV%lmaxnr = EV%lmaxnu
+        endif
 
         if (CP%Do21cm .and. CP%SourceTerms%line_reionization) then
             EV%lmaxg =  EV%lmaxg*8
@@ -1007,8 +1086,8 @@
     call SetupScalarArrayIndices(EVout)
     call CopyScalarVariableArray(y,yout, EV, EVout)
 
-    !Get density and pressure as ratio to massles by interpolation from table
-    call ThermalNuBack%rho_P(a*State%nu_masses(nu_i),rhonu,pnu)
+    !Get density and pressure as ratio to massless neutrinos.
+    call ThermalNuBackground%rho_P(a*State%nu_masses(nu_i),rhonu,pnu)
 
     !Integrate over q
     call Nu_Integrate_L012(EV, y, a, nu_i, clxnu,qnu,dpnu,pinu)
@@ -1056,8 +1135,8 @@
     do nu_i = 1, CP%Nu_mass_eigenstates
         grhormass_t=State%grhormass(nu_i)/a**2
 
-        !Get density and pressure as ratio to massless by interpolation from table
-        call ThermalNuBack%rho_P(a*State%nu_masses(nu_i),rhonu,pnu)
+        !Get density and pressure as ratio to massless neutrinos.
+        call ThermalNuBackground%rho_P(a*State%nu_masses(nu_i),rhonu,pnu)
 
         if (EV%MassiveNuApprox(nu_i)) then
             clxnu=y(EV%nu_ix(nu_i))
@@ -1073,7 +1152,7 @@
             qnu=qnu/rhonu
             clxnu = clxnu/rhonu
             pinu=pinu/rhonu
-            rhonudot = ThermalNuBack%drho(a*State%nu_masses(nu_i),adotoa)
+            rhonudot = ThermalNuBackground%drho(a*State%nu_masses(nu_i),adotoa)
 
             call Nu_pinudot(EV,y, yprime, a,adotoa, nu_i,pinudot)
             pinudot=pinudot/rhonu - rhonudot/rhonu*pinu
@@ -1097,16 +1176,55 @@
 
     end subroutine MassiveNuVarsOut
 
-    subroutine Nu_Integrate_L012(EV,y,a,nu_i,drhonu,fnu,dpnu,pinu)
-    type(EvolutionVars) EV
+    subroutine Nu_Integrate_L01(EV,y,a,nu_i,drhonu,fnu)
+    type(EvolutionVars), intent(in) :: EV
     !  Compute the perturbations of density and energy flux
     !  of one eigenstate of massive neutrinos, in units of the mean
     !  density of one eigenstate of massless neutrinos, by integrating over
     !  momentum.
     integer, intent(in) :: nu_i
     real(dl), intent(in) :: a, y(EV%nvar)
-    real(dl), intent(OUT) ::  drhonu,fnu
-    real(dl), optional, intent(OUT) :: dpnu,pinu
+    real(dl), intent(out) ::  drhonu, fnu
+    real(dl) tmp, am, aq, pert_scale, mass
+    integer iq, ind
+
+    !  q is the comoving momentum in units of k_B*T_nu0/c.
+
+    drhonu=0
+    fnu=0
+    mass = State%nu_masses(nu_i)
+    am=a*mass
+    ind=EV%nu_ix(nu_i)
+    associate(nu_q=>State%NuPerturbations%nu_q, nu_int_kernel=>State%NuPerturbations%nu_int_kernel)
+        do iq=1,EV%nq(nu_i)
+            aq=am/nu_q(iq)
+            drhonu=drhonu + nu_int_kernel(iq) * y(ind) * sqrt(1._dl+aq*aq)
+            fnu=fnu + nu_int_kernel(iq) * y(ind+1)
+            ind=ind + EV%lmaxnu_tau(nu_i)+1
+        end do
+        ind = EV%nu_pert_ix
+        do iq=EV%nq(nu_i)+1,State%NuPerturbations%nqmax
+            !Get the rest from perturbatively relativistic expansion
+            aq=am/nu_q(iq)
+            pert_scale=(mass/nu_q(iq))**2/2
+            tmp = nu_int_kernel(iq)*(y(EV%r_ix)  + pert_scale*y(ind))
+            drhonu=drhonu + tmp * sqrt(1._dl+aq*aq)
+            fnu=fnu+nu_int_kernel(iq)*(y(EV%r_ix+1)+ pert_scale*y(ind+1))
+        end do
+    end associate
+
+    end subroutine Nu_Integrate_L01
+
+    subroutine Nu_Integrate_L012(EV,y,a,nu_i,drhonu,fnu,dpnu,pinu)
+    type(EvolutionVars), intent(in) :: EV
+    !  Compute the perturbations of density and energy flux
+    !  of one eigenstate of massive neutrinos, in units of the mean
+    !  density of one eigenstate of massless neutrinos, by integrating over
+    !  momentum.
+    integer, intent(in) :: nu_i
+    real(dl), intent(in) :: a, y(EV%nvar)
+    real(dl), intent(out) ::  drhonu, fnu
+    real(dl), intent(out) :: dpnu,pinu
     real(dl) tmp, am, aq,v, pert_scale
     integer iq, ind
 
@@ -1114,10 +1232,8 @@
 
     drhonu=0
     fnu=0
-    if (present(dpnu)) then
-        dpnu=0
-        pinu=0
-    end if
+    dpnu=0
+    pinu=0
     am=a*State%nu_masses(nu_i)
     ind=EV%nu_ix(nu_i)
     associate(nu_q=>State%NuPerturbations%nu_q, nu_int_kernel=>State%NuPerturbations%nu_int_kernel)
@@ -1126,10 +1242,8 @@
             v=1._dl/sqrt(1._dl+aq*aq)
             drhonu=drhonu+ nu_int_kernel(iq)* y(ind)/v
             fnu=fnu+nu_int_kernel(iq)* y(ind+1)
-            if (present(dpnu)) then
-                dpnu=dpnu+  nu_int_kernel(iq)* y(ind)*v
-                pinu=pinu+ nu_int_kernel(iq)*y(ind+2)*v
-            end if
+            dpnu=dpnu+  nu_int_kernel(iq)* y(ind)*v
+            pinu=pinu+ nu_int_kernel(iq)*y(ind+2)*v
             ind=ind+EV%lmaxnu_tau(nu_i)+1
         end do
         ind = EV%nu_pert_ix
@@ -1141,15 +1255,11 @@
             tmp = nu_int_kernel(iq)*(y(EV%r_ix)  + pert_scale*y(ind))
             drhonu=drhonu+ tmp/v
             fnu=fnu+nu_int_kernel(iq)*(y(EV%r_ix+1)+ pert_scale*y(ind+1))
-            if (present(dpnu)) then
-                dpnu=dpnu+ tmp*v
-                pinu = pinu+ nu_int_kernel(iq)*(y(EV%r_ix+2)+ pert_scale*y(ind+2))*v
-            end if
+            dpnu=dpnu+ tmp*v
+            pinu = pinu+ nu_int_kernel(iq)*(y(EV%r_ix+2)+ pert_scale*y(ind+2))*v
         end do
     end associate
-    if (present(dpnu)) then
-        dpnu = dpnu/3
-    end if
+    dpnu = dpnu/3
 
     end subroutine Nu_Integrate_L012
 
@@ -1194,7 +1304,6 @@
 
     end subroutine Nu_pinudot
 
-    !ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
     function Nu_pi(EV, y, a, nu_i) result(pinu)
     type(EvolutionVars) EV
     integer, intent(in) :: nu_i
@@ -1217,7 +1326,6 @@
 
     end function Nu_pi
 
-    !cccccccccccccccccccccccccccccccccccccccccccccc
     subroutine Nu_Intvsq(EV,y, a, nu_i, G11,G30)
     type(EvolutionVars) EV
     integer, intent(in) :: nu_i
@@ -1251,7 +1359,7 @@
 
     subroutine MassiveNuVars(EV,y,a,grho,gpres,dgrho,dgq, wnu_arr)
     implicit none
-    type(EvolutionVars) EV
+    type(EvolutionVars), intent(in) :: EV
     real(dl) :: y(EV%nvar), a, grho,gpres,dgrho,dgq
     real(dl), intent(out), optional :: wnu_arr(max_nu)
     !grho = a^2 kappa rho
@@ -1265,15 +1373,15 @@
     do nu_i = 1, CP%Nu_mass_eigenstates
         grhormass_t=State%grhormass(nu_i)/a**2
 
-        !Get density and pressure as ratio to massless by interpolation from table
-        call ThermalNuBack%rho_P(a*State%nu_masses(nu_i),rhonu,pnu)
+        !Get density and pressure as ratio to massless neutrinos.
+        call ThermalNuBackground%rho_P(a*State%nu_masses(nu_i),rhonu,pnu)
 
         if (EV%MassiveNuApprox(nu_i)) then
             clxnu=y(EV%nu_ix(nu_i))
             qnu=y(EV%nu_ix(nu_i)+2)
         else
             !Integrate over q
-            call Nu_Integrate_L012(EV, y, a, nu_i, clxnu,qnu)
+            call Nu_Integrate_L01(EV, y, a, nu_i, clxnu, qnu)
             !clxnu_here  = rhonu*clxnu, qnu_here = qnu*rhonu
             qnu=qnu/rhonu
             clxnu = clxnu/rhonu
@@ -1791,7 +1899,7 @@
     real(dl) Rp15,tau,x,x2,x3,om,omtau, &
         Rc,Rb,Rv,Rg,grhonu,chi
     real(dl) k,k2
-    real(dl) a,a2, iqg, rhomass,a_massive, ep
+    real(dl) a,a2, iqg, rhomass,a_massive, ep, nu_l_accuracy_boost
     integer l,i, nu_i, j, ind
     integer, parameter :: i_clxg=1,i_clxr=2,i_clxc=3, i_clxb=4, &
         i_qg=5,i_qr=6,i_vb=7,i_pir=8, i_eta=9, i_aj3r=10,i_clxde=11,i_vde=12
@@ -1983,12 +2091,17 @@
     if (CP%Num_Nu_massive == 0) return
 
     do nu_i = 1, CP%Nu_mass_eigenstates
+        nu_l_accuracy_boost = MassiveNuTransferLAccuracyBoost(State%nu_masses(nu_i), EV%q, &
+            nu_tau_nonrelativistic_physical(nu_i))
         EV%MassiveNuApproxTime(nu_i) = Nu_tau_massive(nu_i)
-        a_massive =  20000*k/State%nu_masses(nu_i)*CP%Accuracy%AccuracyBoost*CP%Accuracy%lAccuracyBoost
+        a_massive =  20000*k/State%nu_masses(nu_i) &
+            *MassiveNuTransferSwitchBoost(State%nu_masses(nu_i))*nu_l_accuracy_boost
         if (a_massive >=0.99) then
             EV%MassiveNuApproxTime(nu_i)=State%tau0+1
-        else if (a_massive > 17.d0/State%nu_masses(nu_i)*CP%Accuracy%AccuracyBoost) then
-            EV%MassiveNuApproxTime(nu_i)=max(EV%MassiveNuApproxTime(nu_i),State%DeltaTime(0._dl,a_massive, 0.01_dl))
+        else if (a_massive > 17.d0/State%nu_masses(nu_i) &
+            *MassiveNuTransferSwitchBoost(State%nu_masses(nu_i))) then
+            EV%MassiveNuApproxTime(nu_i)=max(EV%MassiveNuApproxTime(nu_i), &
+                State%DeltaTime(0._dl,a_massive, 0.01_dl))
         end if
         ind = EV%nu_ix(nu_i)
         do  i=1,EV%nq(nu_i)
@@ -2605,7 +2718,7 @@
         do nu_i = 1, State%CP%Nu_mass_eigenstates
             if (EV%MassiveNuApprox(nu_i)) then
                 !Now EV%iq0 = clx, EV%iq0+1 = clxp, EV%iq0+2 = G_1, EV%iq0+3=G_2=pinu
-                !see astro-ph/0203507
+                !ie. delta, delta_p/rho, q, pi: see astro-ph/0203507
                 G11_t=EV%G11(nu_i)/a/a2
                 G30_t=EV%G30(nu_i)/a/a2
                 off_ix = EV%nu_ix(nu_i)
