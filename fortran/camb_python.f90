@@ -6,10 +6,13 @@
     use iso_c_binding
     use DarkEnergyFluid
     use DarkEnergyPPF
+    use HypersphericalBesselOlver, only: phi_olver
     use ObjectLists
+    use SpherBessels, only: phi_recurs, phi_derivative, phi_first_peak_chi, phi_first_peak_amplitude
     use classes
     use Interpolation
     use RungeKuttaDP45Module, only : RungeKuttaDP45Settings
+    use Bispectrum, only: TBispectrumParams, TBispectrumResult
     implicit none
 
     Type c_MatterTransferData
@@ -54,6 +57,7 @@
     end interface
 
     integer, private, save, target :: dummy
+    integer, parameter :: OMP_VECTOR_THRESHOLD = 256
 
     contains
 
@@ -177,6 +181,98 @@
 
     end function get_effective_null
 
+    function CAMB_GetPhiOlver(l, K, nu, chi) result(phi) bind(C, name="camb_getphiolver")
+    integer(c_int), value :: l, K
+    real(c_double), value :: nu, chi
+    real(c_double) :: phi
+
+    phi = phi_olver(int(l), int(K), real(nu, dl), real(chi, dl))
+    end function CAMB_GetPhiOlver
+
+    subroutine CAMB_GetPhiOlverArray(phi, l, K, nu, chi, n) bind(C, name="camb_getphiolverarray")
+    integer(c_int), value :: l, K, n
+    real(c_double), value :: nu
+    real(c_double), intent(out) :: phi(*)
+    real(c_double), intent(in) :: chi(*)
+    integer :: i
+
+    if (n >= OMP_VECTOR_THRESHOLD) then
+        !$OMP parallel do default(shared) private(i) schedule(static)
+        do i = 1, n
+            phi(i) = phi_olver(int(l), int(K), real(nu, dl), real(chi(i), dl))
+        end do
+        !$OMP end parallel do
+    else
+        do i = 1, n
+            phi(i) = phi_olver(int(l), int(K), real(nu, dl), real(chi(i), dl))
+        end do
+    end if
+    end subroutine CAMB_GetPhiOlverArray
+
+    function CAMB_GetPhiRecurs(l, K, nu, chi) result(phi) bind(C, name="camb_getphirecurs")
+    integer(c_int), value :: l, K
+    real(c_double), value :: nu, chi
+    real(c_double) :: phi
+
+    phi = phi_recurs(int(l), int(K), real(nu, dl), real(chi, dl))
+    end function CAMB_GetPhiRecurs
+
+    subroutine CAMB_GetPhiRecursArray(phi, l, K, nu, chi, n) bind(C, name="camb_getphirecursarray")
+    integer(c_int), value :: l, K, n
+    real(c_double), value :: nu
+    real(c_double), intent(out) :: phi(*)
+    real(c_double), intent(in) :: chi(*)
+    integer :: i
+
+    if (n >= OMP_VECTOR_THRESHOLD) then
+        !$OMP parallel do default(shared) private(i) schedule(static)
+        do i = 1, n
+            phi(i) = phi_recurs(int(l), int(K), real(nu, dl), real(chi(i), dl))
+        end do
+        !$OMP end parallel do
+    else
+        do i = 1, n
+            phi(i) = phi_recurs(int(l), int(K), real(nu, dl), real(chi(i), dl))
+        end do
+    end if
+    end subroutine CAMB_GetPhiRecursArray
+
+    function CAMB_GetPhiDerivative(l, K, nu, chi) result(dphi) bind(C, name="camb_getphiderivative")
+    integer(c_int), value :: l, K
+    real(c_double), value :: nu, chi
+    real(c_double) :: dphi
+
+    dphi = phi_derivative(int(l), int(K), real(nu, dl), real(chi, dl))
+    end function CAMB_GetPhiDerivative
+
+    function CAMB_GetPhiFirstPeakChi(l, K, nu) result(chi) bind(C, name="camb_getphifirstpeakchi")
+    integer(c_int), value :: l, K
+    real(c_double), value :: nu
+    real(c_double) :: chi
+
+    chi = phi_first_peak_chi(int(l), int(K), real(nu, dl))
+    end function CAMB_GetPhiFirstPeakChi
+
+    function CAMB_GetPhiFirstPeakNoPeakFound(l, K, nu) result(no_peak) &
+        bind(C, name="camb_getphifirstpeaknopeakfound")
+    integer(c_int), value :: l, K
+    real(c_double), value :: nu
+    integer(c_int) :: no_peak
+    logical :: no_peak_found
+    real(dl) :: chi
+
+    chi = phi_first_peak_chi(int(l), int(K), real(nu, dl), no_peak_found)
+    no_peak = merge(1_c_int, 0_c_int, no_peak_found)
+    end function CAMB_GetPhiFirstPeakNoPeakFound
+
+    function CAMB_GetPhiFirstPeakAmplitude(l, K, nu) result(peak) bind(C, name="camb_getphifirstpeakamplitude")
+    integer(c_int), value :: l, K
+    real(c_double), value :: nu
+    real(c_double) :: peak
+
+    peak = phi_first_peak_amplitude(int(l), int(K), real(nu, dl))
+    end function CAMB_GetPhiFirstPeakAmplitude
+
     subroutine F2003Class_get_id(SelfPtr, pSource)
     TYPE(C_FUNPTR), INTENT(IN) :: SelfPtr
     procedure(TSelfPointer), pointer :: SelfFunc
@@ -255,6 +351,30 @@
     call CAMB_GetResults(Data, Params, error, onlytransfer, onlytimesources)
 
     end function CAMBdata_GetTransfers
+
+    function CAMBdata_GetBispectrum(Data, Params, BParams, BResult, output_root) result(error)
+    Type(CAMBdata) :: Data
+    type(CAMBparams) :: Params
+    Type(TBispectrumParams) :: BParams
+    Type(TBispectrumResult) :: BResult
+    character(LEN=*), intent(in) :: output_root
+    integer :: error
+
+    error = 0
+    call CAMB_GetResults(Data, Params, error, .false., .false., BParams, BResult, output_root)
+
+    end function CAMBdata_GetBispectrum
+
+    function CAMB_BispectrumFisherCompiled() result(compiled)
+    integer :: compiled
+
+#ifdef FISHER
+    compiled = 1
+#else
+    compiled = 0
+#endif
+
+    end function CAMB_BispectrumFisherCompiled
 
     function CAMBdata_CalcBackgroundTheory(Data, P) result(error)
     use cambmain, only: initvars
@@ -362,7 +482,7 @@
 
     cData%NumSources = CTrans%NumSources
     if (allocated(CTrans%q%points)) then
-        cData%q_size = size(CTrans%q%points)
+        cData%q_size = CTrans%q%npoints
         cData%q = c_loc(CTrans%q%points)
     else
         cData%q_size = 0
@@ -684,46 +804,34 @@
 
 
     subroutine GetBackgroundThermalEvolution(this, ntimes, times, outputs)
-    use splines
+    use Interpolation, only : TLogRegularCubicSpline
     Type(CAMBdata) :: this
     integer, intent(in) :: ntimes
     real(dl), intent(in) :: times(ntimes)
     real(dl) :: outputs(9, ntimes)
-    real(dl), allocatable :: spline_data(:), ddxe(:), ddTb(:)
-    real(dl) :: a, d, tau, cs2b, opacity, Tbaryon, dopacity, ddopacity, &
+    Type(TLogRegularCubicSpline) :: xe_spline, Tb_spline
+    real(dl) :: a, tau, tau_max, tau_spline, cs2b, opacity, Tbaryon, dopacity, ddopacity, &
         visibility, dvisibility, ddvisibility, exptau, lenswindow
-    integer i, ix
+    integer ix
 
     if (.not. this%ThermoData%HasTHermoData) call this%ThermoData%Init(this,min(1d-3,max(1d-5,minval(times))))
 
     associate(T=>this%ThermoData)
-        allocate(spline_data(T%nthermo), ddxe(T%nthermo), ddTb(T%nthermo))
-        call splini(spline_data,T%nthermo)
-        call splder(T%xe,ddxe,T%nthermo,spline_data)
-        call splder(T%Tb,ddTb,T%nthermo,spline_data)
+        tau_max = T%tauminn*exp((T%nthermo - 1)*T%dlntau)
+        call xe_spline%Init(T%tauminn, tau_max, T%nthermo, T%xe)
+        call Tb_spline%Init(T%tauminn, tau_max, T%nthermo, T%Tb)
 
         outputs = 0
         do ix = 1, ntimes
             tau = times(ix)
             if (tau < T%tauminn*1.01) cycle
-            d=log(tau/T%tauminn)/T%dlntau+1._dl
-            i=int(d)
-            d=d-i
+            tau_spline = min(tau, tau_max)
             call T%Values(tau,a,cs2b, opacity)
             call T%IonizationFunctionsAtTime(tau, a, opacity, dopacity, ddopacity, &
                 visibility, dvisibility, ddvisibility, exptau, lenswindow)
 
-            if (i < T%nthermo) then
-                outputs(1,ix)=T%xe(i)+d*(ddxe(i)+d*(3._dl*(T%xe(i+1)-T%xe(i)) &
-                    -2._dl*ddxe(i)-ddxe(i+1)+d*(ddxe(i)+ddxe(i+1) &
-                    +2._dl*(T%xe(i)-T%xe(i+1)))))
-                Tbaryon = T%tb(i)+d*(ddtb(i)+d*(3._dl*(T%tb(i+1)-T%tb(i)) &
-                    -2._dl*ddtb(i)-ddtb(i+1)+d*(ddtb(i)+ddtb(i+1) &
-                    +2._dl*(T%tb(i)-T%tb(i+1)))))
-            else
-                outputs(1,ix)=T%xe(T%nthermo)
-                Tbaryon = T%Tb(T%nthermo)
-            end if
+            outputs(1,ix) = xe_spline%Value(tau_spline)
+            Tbaryon = Tb_spline%Value(tau_spline)
 
             outputs(2, ix) = opacity
             outputs(3, ix) = visibility

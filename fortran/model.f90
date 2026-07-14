@@ -133,7 +133,7 @@
         !Number of L below Max_l down to which lensed C_L are guaranteed to be output;
         !the unlensed C_L used in the lensing convolution is treated as reliable to
         !Max_l - (lens_output_margin - 50), so this also fixes the lensed convolution margin.
-        real(dl)  :: Max_eta_k = 5000
+        real(dl)  :: Max_eta_k = 6250
         real(dl)  :: Max_eta_k_tensor = 1200
         ! _tensor settings only used in initialization,
         !Max_l and Max_eta_k are set to the tensor variables if only tensors requested
@@ -241,7 +241,8 @@
     end subroutine CAMBparams_Replace
 
     subroutine CAMBparams_SetNeutrinoHierarchy(this, omnuh2, omnuh2_sterile, nnu, neutrino_hierarchy, num_massive_neutrinos)
-    !Set neutrino hierarchy in the approximate two-eigenstate model (treating two as exactly degenerate, and assuming non-relativistic),
+    !Set neutrino hierarchy in the approximate two-eigenstate model (treating two as exactly degenerate,
+    !and assuming non-relativistic),
     !or use degenerate mass approximation.
     !omnuh2 is the massive total neutrino density today, omnuh2_sterile is the component of that due to steriles
     !omnuh2_sterile is interpreted as in the Planck parameter papers

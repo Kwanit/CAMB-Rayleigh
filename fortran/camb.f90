@@ -2,6 +2,7 @@
 
     module CAMB
     use Precision
+    use MathUtils, only: brentq
     use results
     use GaugeInterface
     use InitialPower
@@ -10,6 +11,15 @@
     use lensing
     use DarkEnergyFluid
     implicit none
+
+    type TCAMBThetaH0Solver
+        type(CAMBparams) :: Params
+        type(CAMBdata) :: Data
+        real(dl) :: theta = 0._dl
+        real(dl) :: zstar = 0._dl
+        logical :: cosmomc_approx = .false.
+    end type TCAMBThetaH0Solver
+
     contains
 
     subroutine CAMB_TransfersToPowers(CData)
@@ -47,7 +57,8 @@
     end subroutine CAMB_TransfersToPowers
 
     !Call this routine with a set of parameters to generate the results you want.
-    subroutine CAMB_GetResults(OutData, Params, error, onlytransfer, onlytimesources)
+    subroutine CAMB_GetResults(OutData, Params, error, onlytransfer, onlytimesources, &
+        BispectrumConfig, BispectrumResult, bispectrum_output_root)
     use CAMBmain
     use lensing
     use Bispectrum
@@ -55,10 +66,20 @@
     type(CAMBparams) :: Params
     integer, optional :: error !Zero if OK
     logical, optional :: onlytransfer, onlytimesources
+    Type(TBispectrumParams), optional, intent(in) :: BispectrumConfig
+    Type(TBispectrumResult), optional :: BispectrumResult
+    character(LEN=*), optional, intent(in) :: bispectrum_output_root
     type(CAMBparams) P
-    logical :: call_again
+    logical :: call_again, calc_bispectrum, old_do_bispectrum
 
     global_error_flag = 0
+    old_do_bispectrum = do_bispectrum
+    if (present(BispectrumConfig)) then
+        calc_bispectrum = BispectrumConfig%do_lensing_bispectrum .or. BispectrumConfig%do_primordial_bispectrum
+        do_bispectrum = calc_bispectrum
+    else
+        calc_bispectrum = do_bispectrum
+    end if
     call_again = .false.
     call OutData%Free()
     call SetActiveState(OutData)
@@ -76,6 +97,7 @@
         if (global_error_flag==0) call cmbmain
         if (global_error_flag/=0) then
             if (present(error)) error =global_error_flag
+            do_bispectrum = old_do_bispectrum
             return
         end if
         call_again = .true.
@@ -91,6 +113,7 @@
         if (global_error_flag==0) call cmbmain
         if (global_error_flag/=0) then
             if (present(error)) error =global_error_flag
+            do_bispectrum = old_do_bispectrum
             return
         end if
         call_again = .true.
@@ -98,6 +121,7 @@
 
     if (Params%WantCls .and. Params%WantScalars) then
         P = Params
+        if (calc_bispectrum) P%Accuracy%lSampleBoost = max(P%Accuracy%lSampleBoost, 50._dl)
         P%Max_eta_k=max(min(P%max_l,3000)*2.5_dl,P%Max_eta_k)
         P%WantTensors = .false.
         P%WantVectors = .false.
@@ -109,6 +133,7 @@
         if (global_error_flag==0) call cmbmain
         if (global_error_flag/=0) then
             if (present(error)) error =global_error_flag
+            do_bispectrum = old_do_bispectrum
             return
         end if
         call_again = .true.
@@ -125,6 +150,7 @@
         if (global_error_flag==0) call cmbmain
         if (global_error_flag/=0) then
             if (present(error)) error =global_error_flag
+            do_bispectrum = old_do_bispectrum
             return
         end if
     end if
@@ -134,6 +160,7 @@
     OutData%CP%WantVectors = Params%WantVectors
     OutData%CP%WantTransfer = Params%WantTransfer
     OutData%CP%Accuracy = Params%Accuracy
+    if (calc_bispectrum) OutData%CP%Accuracy%lSampleBoost = max(OutData%CP%Accuracy%lSampleBoost, 50._dl)
     OutData%CP%Reion%Reionization = Params%Reion%Reionization
     OutData%CP%Transfer%high_precision = Params%Transfer%high_precision
     OutData%CP%WantDerivedParameters = Params%WantDerivedParameters
@@ -143,10 +170,21 @@
             call lens_Cls(OutData)
         end if
 
-        if (do_bispectrum .and. global_error_flag==0) &
-            call GetBispectrum(OutData,OutData%CLData%CTransScal)
+        if (calc_bispectrum .and. global_error_flag==0) then
+            if (present(BispectrumConfig)) then
+                if (present(bispectrum_output_root)) then
+                    call GetBispectrum(OutData, OutData%CLData%CTransScal, &
+                        BispectrumConfig, BispectrumResult, bispectrum_output_root)
+                else
+                    call GetBispectrum(OutData, OutData%CLData%CTransScal, BispectrumConfig, BispectrumResult)
+                end if
+            else
+                call GetBispectrum(OutData,OutData%CLData%CTransScal)
+            end if
+        end if
     end if
     if (global_error_flag/=0 .and. present(error)) error =global_error_flag
+    do_bispectrum = old_do_bispectrum
 
     end subroutine CAMB_GetResults
 
@@ -210,6 +248,7 @@
     P%Nu_mass_numbers=0
     P%Nu_mass_degeneracies=0
     P%Nu_mass_fractions=0
+    P%lens_output_margin = 200
 
     allocate(THalofit::P%NonLinearModel)
     allocate(TDarkEnergyFluid::P%DarkEnergy)
@@ -218,6 +257,97 @@
     allocate(TTanhReionization::P%Reion)
 
     end subroutine CAMB_SetDefParams
+
+    real(dl) function CAMB_ThetaH0Difference(obj, H0)
+    class(*) :: obj
+    real(dl), intent(in) :: H0
+    integer :: error
+
+    select type (solver => obj)
+    type is (TCAMBThetaH0Solver)
+        solver%Params%H0 = H0
+        call solver%Data%SetParams(solver%Params, error=error, background_only=.true.)
+        if (error /= 0) then
+            CAMB_ThetaH0Difference = huge(1._dl)
+            return
+        end if
+        if (solver%cosmomc_approx) then
+            CAMB_ThetaH0Difference = solver%Data%CosmomcTheta() - solver%theta
+        else
+            CAMB_ThetaH0Difference = solver%Data%sound_horizon(solver%zstar) / &
+                (solver%Data%AngularDiameterDistance(solver%zstar) * (1 + solver%zstar)) - solver%theta
+        end if
+    class default
+        error stop 'CAMB_ThetaH0Difference: unexpected solver state'
+    end select
+
+    end function CAMB_ThetaH0Difference
+
+    logical function CAMB_SetH0ForTheta(P, theta, ErrMsg, cosmomc_approx, theta_H0_range, est_H0, iteration_threshold)
+    type(CAMBparams), intent(inout) :: P
+    real(dl), intent(in) :: theta
+    character(LEN=*), intent(out) :: ErrMsg
+    logical, intent(in), optional :: cosmomc_approx
+    real(dl), intent(in), optional :: theta_H0_range(2)
+    real(dl), intent(in), optional :: est_H0, iteration_threshold
+    type(TCAMBThetaH0Solver) :: solver
+    real(dl) :: H0_range(2), initial_H0, H0_iteration_threshold
+    real(dl) :: xzero, fzero
+    integer :: error, iflag
+
+    CAMB_SetH0ForTheta = .false.
+    ErrMsg = ''
+
+    H0_range = [10._dl, 100._dl]
+    if (present(theta_H0_range)) H0_range = theta_H0_range
+    initial_H0 = 67._dl
+    if (present(est_H0)) initial_H0 = est_H0
+    H0_iteration_threshold = 8._dl
+    if (present(iteration_threshold)) H0_iteration_threshold = iteration_threshold
+
+    if (.not. (theta > 0.001_dl .and. theta < 0.1_dl)) then
+        ErrMsg = 'theta looks wrong (parameter is just theta, not 100*theta)'
+        return
+    end if
+
+    solver%Params = P
+    solver%theta = theta
+    solver%cosmomc_approx = PresentDefault(.false., cosmomc_approx)
+    if (.not. solver%cosmomc_approx) solver%Params%H0 = initial_H0
+
+    call solver%Data%SetParams(solver%Params, error=error, background_only=.true.)
+    if (error /= 0) then
+        ErrMsg = trim(global_error_message)
+        return
+    end if
+
+    if (.not. solver%cosmomc_approx) solver%zstar = solver%Data%get_zstar()
+
+    call brentq(solver, CAMB_ThetaH0Difference, H0_range(1), H0_range(2), 5e-5_dl, xzero, fzero, iflag)
+    if (iflag /= 0) then
+        ErrMsg = 'No solution for H0 inside of theta_H0_range'
+        return
+    end if
+
+    solver%Params%H0 = xzero
+    if (.not. solver%cosmomc_approx .and. abs(xzero - initial_H0) > H0_iteration_threshold) then
+        call solver%Data%SetParams(solver%Params, error=error, background_only=.true.)
+        if (error /= 0) then
+            ErrMsg = trim(global_error_message)
+            return
+        end if
+        solver%zstar = solver%Data%get_zstar()
+        call brentq(solver, CAMB_ThetaH0Difference, H0_range(1), H0_range(2), 5e-5_dl, xzero, fzero, iflag)
+        if (iflag /= 0) then
+            ErrMsg = 'No solution for H0 inside of theta_H0_range'
+            return
+        end if
+    end if
+
+    P%H0 = xzero
+    CAMB_SetH0ForTheta = .true.
+
+    end function CAMB_SetH0ForTheta
 
     logical function CAMB_ReadParamFile(P, InputFile, InpLen)
     Type(CAMBParams) :: P
@@ -252,13 +382,15 @@
     Type(CAMBParams) :: P
     integer num_redshiftwindows
     logical PK_WantTransfer
-    integer i, status
-    real(dl) nmassive
+    integer i, status, num_theta_inputs
+    real(dl) nmassive, theta
     character(LEN=*), intent(out) :: ErrMsg
     character(LEN=:), allocatable :: NumStr, S, DarkEneryModel, RecombinationModel
-    logical :: DoCounts
+    logical :: DoCounts, has_hubble, has_thetastar, has_cosmomc_theta
 
     ErrMsg = ''
+    global_error_flag = 0
+    global_error_message = ''
 
     CAMB_ReadParams = .false.
     call CAMB_SetDefParams(P)
@@ -306,7 +438,7 @@
             else
                 P%Do21cm = .true.
                 RedWin%sigma = Ini%Read_Double_Array('redshift_sigma_Mhz', i)
-                if (RedWin%sigma < 0.003) then
+                if (RedWin%sigma < 0.003 .and. print_fortran_warnings) then
                     write(*,*) 'WARNING:Window very narrow.'
                     write(*,*) ' --> use transfer functions and transfer_21cm_cl =T ?'
                 end if
@@ -363,6 +495,7 @@
     call ReadAccuracyReal(P%Accuracy%lAccuracyBoost, 'lAccuracyBoost', 'l_accuracy_boost')
     call ReadAccuracyReal(P%Accuracy%TimeStepBoost, 'TimeStepBoost')
     call ReadAccuracyReal(P%Accuracy%BackgroundTimeStepBoost, 'BackgroundTimeStepBoost')
+    call ReadAccuracyReal(P%Accuracy%TimeSwitchBoost, 'TimeSwitchBoost')
     call ReadAccuracyReal(P%Accuracy%IntTolBoost, 'IntTolBoost')
     call ReadAccuracyReal(P%Accuracy%SourcekAccuracyBoost, 'SourcekAccuracyBoost')
     call ReadAccuracyReal(P%Accuracy%IntkAccuracyBoost, 'IntkAccuracyBoost')
@@ -388,7 +521,8 @@
     if (P%WantCls) then
         if (P%WantScalars  .or. P%WantVectors) then
             P%Max_l = Ini%Read_Int('l_max_scalar')
-            P%Max_eta_k = Ini%Read_Double('k_eta_max_scalar', P%Max_l*2._dl)
+            P%Max_eta_k = Ini%Read_Double('k_eta_max_scalar', P%Max_l*2.5_dl)
+            P%lens_output_margin = Ini%Read_Int('lens_output_margin', P%lens_output_margin)
             if (P%WantScalars) then
                 P%DoLensing = Ini%Read_Logical('do_lensing', .false.)
                 if (P%DoLensing) lensing_method = Ini%Read_Int('lensing_method', 1)
@@ -435,7 +569,51 @@
     end if
     call P%DarkEnergy%ReadParams(Ini)
 
-    P%h0 = Ini%Read_Double('hubble')
+    RecombinationModel = UpperCase(Ini%Read_String_Default('recombination_model', 'Recfast'))
+    if (RecombinationModel == 'COSMOREC') then
+#ifdef COSMOREC
+        deallocate(P%Recomb)
+        allocate(TCosmoRec::P%Recomb)
+#else
+        ErrMsg = 'Compile with CosmoRec to use recombination_model=CosmoRec'
+        return
+#endif
+    else if (RecombinationModel == 'HYREC') then
+#ifdef HYREC
+        deallocate(P%Recomb)
+        allocate(THyRec::P%Recomb)
+#else
+        ErrMsg = 'Compile with HyRec to use recombination_model=HyRec'
+        return
+#endif
+    else if (RecombinationModel /= 'RECFAST') then
+        ErrMsg =  'Unknown recombination_model: '//trim(RecombinationModel)
+        return
+    end if
+
+    call P%Recomb%ReadParams(Ini)
+    if (global_error_flag /= 0) then
+        ErrMsg = trim(global_error_message)
+        return
+    end if
+
+    has_hubble = Ini%HasKey('hubble')
+    has_thetastar = Ini%HasKey('thetastar')
+    has_cosmomc_theta = Ini%HasKey('cosmomc_theta')
+    num_theta_inputs = merge(1, 0, has_hubble) + merge(1, 0, has_thetastar) + merge(1, 0, has_cosmomc_theta)
+    if (num_theta_inputs > 1) then
+        ErrMsg = 'Can only set one of hubble, thetastar, cosmomc_theta'
+        return
+    else if (num_theta_inputs == 0) then
+        ErrMsg = 'Must set one of hubble, thetastar, cosmomc_theta'
+        return
+    else if (has_hubble) then
+        P%h0 = Ini%Read_Double('hubble')
+    else if (has_thetastar) then
+        theta = Ini%Read_Double('thetastar')
+    else
+        theta = Ini%Read_Double('cosmomc_theta')
+    end if
 
     if (Ini%Read_Logical('use_physical', .true.)) then
         P%ombh2 = Ini%Read_Double('ombh2')
@@ -474,7 +652,8 @@
         P%share_delta_neff = Ini%Read_Logical('share_delta_neff', .true.)
         numstr = Ini%Read_String('nu_mass_degeneracies')
         if (P%share_delta_neff) then
-            if (numstr/='') write (*,*) 'WARNING: nu_mass_degeneracies ignored when share_delta_neff'
+            if (numstr/='' .and. print_fortran_warnings) &
+                write (*,*) 'WARNING: nu_mass_degeneracies ignored when share_delta_neff'
         else
             if (numstr=='') then
                 ErrMsg = 'must give degeneracies for each eigenstate if share_delta_neff=F'
@@ -492,6 +671,10 @@
         else
             read(numstr,*) P%Nu_mass_fractions(1:P%Nu_mass_eigenstates)
         end if
+    end if
+
+    if (has_thetastar .or. has_cosmomc_theta) then
+        if (.not. CAMB_SetH0ForTheta(P, theta, ErrMsg, cosmomc_approx=has_cosmomc_theta)) return
     end if
 
     if (((P%NonLinear==NonLinear_lens .or. P%NonLinear==NonLinear_both) .and. P%DoLensing) .or. PK_WantTransfer) then
@@ -525,7 +708,7 @@
         P%transfer%PK_num_redshifts = Ini%Read_Int('transfer_num_redshifts')
 
         if (P%Do21cm) P%transfer_21cm_cl = Ini%Read_Logical('transfer_21cm_cl',.false.)
-        if (P%transfer_21cm_cl .and. P%transfer%kmax > 800) then
+        if (P%transfer_21cm_cl .and. P%transfer%kmax > 800 .and. print_fortran_warnings) then
             !Actually line widths are important at significantly larger scales too
             write (*,*) 'WARNING: kmax very large. '
             write(*,*) ' -- Neglected line width effects will dominate'
@@ -550,30 +733,6 @@
     call P%Reion%ReadParams(Ini)
     call P%InitPower%ReadParams(Ini)
 
-    RecombinationModel = UpperCase(Ini%Read_String_Default('recombination_model', 'Recfast'))
-    if (RecombinationModel == 'COSMOREC') then
-#ifdef COSMOREC
-        deallocate(P%Recomb)
-        allocate(TCosmoRec::P%Recomb)
-#else
-        ErrMsg = 'Compile with CosmoRec to use recombination_model=CosmoRec'
-        return
-#endif
-    else if (RecombinationModel == 'HYREC') then
-#ifdef HYREC
-        deallocate(P%Recomb)
-        allocate(THyRec::P%Recomb)
-#else
-        ErrMsg = 'Compile with HyRec to use recombination_model=HyRec'
-        return
-#endif
-    else if (RecombinationModel /= 'RECFAST') then
-        ErrMsg =  'Unknown recombination_model: '//trim(RecombinationModel)
-        return
-    end if
-
-    call P%Recomb%ReadParams(Ini)
-
     if (P%WantScalars .or. P%WantTransfer) then
         P%Scalar_initial_condition = Ini%Read_Int('initial_condition', initial_adiabatic)
         if (P%Scalar_initial_condition == initial_vector) then
@@ -594,7 +753,7 @@
     call ReadAccuracyLogical(P%Accuracy%AccurateReionization, 'AccurateReionization', 'accurate_reionization')
     call ReadAccuracyLogical(P%Accuracy%AccurateBB, 'AccurateBB', 'accurate_BB')
     if (ErrMsg /= '') return
-    if (P%Accuracy%AccurateBB .and. P%WantCls .and. (P%Max_l < 3500 .or. &
+    if (print_fortran_warnings .and. P%Accuracy%AccurateBB .and. P%WantCls .and. (P%Max_l < 3500 .or. &
         (P%NonLinear/=NonLinear_lens .and. P%NonLinear/=NonLinear_both) .or. P%Max_eta_k < 18000)) &
         write(*,*) 'WARNING: for accurate lensing BB you need high l_max_scalar, k_eta_max_scalar and non-linear lensing'
 
@@ -608,6 +767,7 @@
     P%MassiveNuMethod = Ini%Read_Int('massive_nu_approx', Nu_best)
 
     call ReadAccuracyReal(P%Accuracy%lSampleBoost, 'lSampleBoost', 'l_sample_boost')
+    call Ini%Read('min_l_logl_sampling', P%min_l_logl_sampling)
     if (ErrMsg /= '') return
 
     CAMB_ReadParams = .true.
@@ -669,14 +829,11 @@
     character(len=:), allocatable :: outroot, VectorFileName, &
         ScalarFileName, TensorFileName, TotalFileName, LensedFileName,&
         LensedTotFileName, LensPotentialFileName, ScalarCovFileName, &
-        version_check
+        version_check, ArrayKey
     integer :: i
     character(len=Ini_max_string_len), allocatable :: TransferFileNames(:), &
         MatterPowerFileNames(:), TransferClFileNames(:)
     real(dl) :: output_factor
-#ifdef WRITE_FITS
-    character(LEN=Ini_max_string_len) FITSfilename
-#endif
     logical PK_WantTransfer
     Type(CAMBdata) :: ActiveState
 
@@ -696,18 +853,22 @@
         allocate (MatterPowerFileNames(P%Transfer%PK_num_redshifts))
         allocate (TransferClFileNames(P%Transfer%PK_num_redshifts))
         do i=1, P%transfer%PK_num_redshifts
-            transferFileNames(i)     = Ini%Read_String_Array('transfer_filename', i)
-            MatterPowerFilenames(i)  = Ini%Read_String_Array('transfer_matterpower', i)
-            if (TransferFileNames(i) == '') then
-                TransferFileNames(i) =  trim(numcat('transfer_',i))//'.dat'
+            ArrayKey = Ini%Key_To_Arraykey('transfer_filename', i)
+            if (i == 1) then
+                TransferFileNames(i) = Ini%Read_String_Default(ArrayKey, 'transfer_out.dat')
+            else
+                TransferFileNames(i) = Ini%Read_String_Default(ArrayKey, trim(numcat('transfer_',i))//'.dat')
             end if
-            if (MatterPowerFilenames(i) == '') then
-                MatterPowerFilenames(i) =  trim(numcat('matterpower_',i))//'.dat'
+
+            ArrayKey = Ini%Key_To_Arraykey('transfer_matterpower', i)
+            if (i == 1) then
+                MatterPowerFilenames(i) = Ini%Read_String_Default(ArrayKey, 'matterpower.dat', .true.)
+            else
+                MatterPowerFilenames(i) = Ini%Read_String_Default(ArrayKey, trim(numcat('matterpower_',i))//'.dat', .true.)
             end if
-            if (TransferFileNames(i)/= '') &
-                TransferFileNames(i) = trim(outroot)//TransferFileNames(i)
-            if (MatterPowerFilenames(i) /= '') &
-                MatterPowerFilenames(i)=trim(outroot)//MatterPowerFilenames(i)
+
+            TransferFileNames(i) = outroot // TransferFileNames(i)
+            if (MatterPowerFilenames(i) /= '') MatterPowerFilenames(i) = outroot // MatterPowerFilenames(i)
 
             if (P%Do21cm) then
                 TransferClFileNames(i) = Ini%Read_String_Array('transfer_cl_filename',i)
@@ -718,7 +879,7 @@
             end if
 
             if (TransferClFileNames(i)/= '') &
-                TransferClFileNames(i) = trim(outroot)//TransferClFileNames(i)
+                TransferClFileNames(i) = outroot // TransferClFileNames(i)
         end do
     end if
 
@@ -727,15 +888,17 @@
     output_factor = Ini%Read_Double('CMB_outputscale', 1.d0)
 
     if (P%WantScalars) then
-        ScalarFileName = trim(outroot) // Ini%Read_String('scalar_output_file')
-        LensedFileName = trim(outroot) // Ini%Read_String('lensed_output_file')
-        LensPotentialFileName = Ini%Read_String('lens_potential_output_file')
-        if (LensPotentialFileName/='') LensPotentialFileName = concat(outroot,LensPotentialFileName)
+        ScalarFileName = Ini%Read_String_Default('scalar_output_file', 'scalCls.dat', .true.)
+        if (ScalarFileName /= '') ScalarFileName = outroot // ScalarFileName
+        LensedFileName = Ini%Read_String_Default('lensed_output_file', 'lensedCls.dat')
+        LensedFileName = outroot // LensedFileName
+        LensPotentialFileName = Ini%Read_String_Default('lens_potential_output_file', 'lenspotentialCls.dat')
+        LensPotentialFileName = outroot // LensPotentialFileName
         ScalarCovFileName = Ini%Read_String_Default('scalar_covariance_output_file', &
             'scalarCovCls.dat', .false.)
         if (ScalarCovFileName /= '') then
             P%want_cl_2D_array = .true.
-            ScalarCovFileName = concat(outroot, ScalarCovFileName)
+            ScalarCovFileName = outroot // ScalarCovFileName
         end if
     else
         ScalarFileName = ''
@@ -744,11 +907,13 @@
         ScalarCovFileName = ''
     end if
     if (P%WantTensors) then
-        TensorFileName = trim(outroot) // Ini%Read_String('tensor_output_file')
+        TensorFileName = Ini%Read_String_Default('tensor_output_file', 'tensCls.dat')
+        TensorFileName = outroot // TensorFileName
         if (P%WantScalars) then
-            TotalFileName = trim(outroot) // Ini%Read_String('total_output_file')
-            LensedTotFileName = Ini%Read_String('lensed_total_output_file')
-            if (LensedTotFileName /= '') LensedTotFileName = trim(outroot) // trim(LensedTotFileName)
+            TotalFileName = Ini%Read_String_Default('total_output_file', 'totCls.dat', .true.)
+            if (TotalFileName /= '') TotalFileName = outroot // TotalFileName
+            LensedTotFileName = Ini%Read_String_Default('lensed_total_output_file', 'lensedtotCls.dat')
+            LensedTotFileName = outroot // LensedTotFileName
         else
             TotalFileName = ''
             LensedTotFileName = ''
@@ -759,29 +924,17 @@
         LensedTotFileName = ''
     end if
     if (P%WantVectors) then
-        VectorFileName = trim(outroot) // Ini%Read_String('vector_output_file')
+        VectorFileName = Ini%Read_String_Default('vector_output_file', 'vecCls.dat')
+        VectorFileName = outroot // VectorFileName
     else
         VectorFileName = ''
     end if
-
-#ifdef WRITE_FITS
-    if (P%WantCls) then
-        FITSfilename = trim(outroot) // Ini%Read_String('FITS_filename', .true.)
-        if (FITSfilename /= '') then
-            inquire(file=FITSfilename, exist=bad)
-            if (bad) then
-                open(unit=18, file=FITSfilename, status='old')
-                close(18, status='delete')
-            end if
-        end if
-    end if
-#endif
 
     version_check = Ini%Read_String('version_check')
     if (version_check == '') then
         !tag the output used parameters .ini file with the version of CAMB being used now
         call Ini%ReadValues%Add('version_check', version)
-    else if (version_check /= version) then
+    else if (version_check /= version .and. print_fortran_warnings) then
         write(*,*) 'WARNING: version_check does not match this CAMB version'
     end if
 
@@ -826,9 +979,6 @@
             call State%CLData%output_veccl_files(State%CP,VectorFileName, output_factor)
         end if
 
-#ifdef WRITE_FITS
-        if (FITSfilename /= '') call WriteFitsCls(State, FITSfilename, CP%Max_l)
-#endif
     end if
 
     CAMB_RunFromIni = .true.
@@ -890,8 +1040,12 @@
     highL_unlensed_cl_template = Ini%Read_String_Default( &
         'highL_unlensed_cl_template', highL_unlensed_cl_template)
     call Ini%Read('number_of_threads', ThreadNum)
+    call Ini%Read('AccuracyTarget', AccuracyTarget)
     call Ini%Read('DebugParam', DebugParam)
+    if (Ini%HasKey('enable_olver_source_integration')) &
+        call Ini%Read('enable_olver_source_integration', enable_olver_source_integration)
     call Ini%Read('feedback_level', FeedbackLevel)
+    call Ini%Read('print_fortran_warnings', print_fortran_warnings)
     if (Ini%HasKey('DebugMsgs')) call Ini%Read('DebugMsgs', DebugMsgs)
 
     Ini%Fail_on_not_found = .false.
