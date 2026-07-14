@@ -1,4 +1,4 @@
-    ! Modules used by cmbmain and other routines.
+! Modules used by cmbmain and other routines.
 
     !     Code for Anisotropies in the Microwave Background
     !     by Antony Lewis (http://cosmologist.info) and Anthony Challinor
@@ -32,7 +32,8 @@
     use MathUtils
     use config
     use model
-    use splines
+    use Interpolation
+    !$ use omp_lib, only: omp_get_max_threads
     implicit none
     public
 
@@ -44,12 +45,17 @@
         derived_zdrag=6, derived_rdrag=7,derived_kD=8,derived_thetaD=9, derived_zEQ =10, derived_keq =11, &
         derived_thetaEQ=12, derived_theta_rs_EQ = 13
     integer, parameter :: nthermo_derived = 13
+    real(dl), parameter :: near_flat_scale_tol = 0.03_dl
+    real(dl), parameter :: template_shift_scale_tol = 0.01_dl
+    ! Fiducial r_s(zdrag)/D_M from inifiles/planck_2018.ini, matching the high-l template cosmology.
+    real(dl), parameter :: planck2018_drag_angle = 0.010392206684501_dl
 
     Type lSamples
         integer :: nl = 0
         integer :: lmin = 2
         integer, allocatable :: l(:)
         logical :: use_spline_template = .true.
+        real(dl) :: template_l_scale = 1._dl
     contains
     procedure :: Init => lSamples_init
     procedure :: IndexOf => lSamples_indexOf
@@ -60,6 +66,10 @@
     logical, parameter :: dowinlens = .false. !not used, test getting CMB lensing using visibility
     integer, parameter :: thermal_history_def_timesteps = 20000
 
+    Type TThermoHorner
+        real(dl) :: cs2b(4), opacity(4), a(4), dopacity(4)
+    end Type TThermoHorner
+
     Type TThermoData
         logical :: HasThermoData = .false. !Has it been computed yet for current parameters?
         !Background thermal history, interpolated from precomputed tables
@@ -67,9 +77,10 @@
         !baryon temperature, sound speed, ionization fractions, and opacity
         real(dl), dimension(:), allocatable :: tb, cs2, xe, dotmu
         ! e^(-tau) and derivatives
-        real(dl), dimension(:), allocatable :: emmu, dcs2,demmu, ddotmu, dddotmu, ddddotmu
-        real(dl), dimension(:), allocatable :: ScaleFactor, dScaleFactor, adot, dadot
+        real(dl), dimension(:), allocatable :: emmu, demmu, ddotmu, dddotmu, ddddotmu
+        real(dl), dimension(:), allocatable :: ScaleFactor, adot, dadot
         real(dl), dimension(:), allocatable :: winlens, dwinlens
+        Type(TThermoHorner), dimension(:), allocatable :: thermo_horner
         real(dl) tauminn,dlntau
         real(dl) :: tight_tau, actual_opt_depth
         !Times when 1/(opacity*tau) = 0.01, for use switching tight coupling approximation
@@ -179,8 +190,9 @@
 
         real(dl) Omega_de
         real(dl) curv, curvature_radius, Ksign !curvature_radius = 1/sqrt(|curv|), Ksign = 1,0 or -1
-        real(dl) tau0,chi0 !time today and rofChi(tau0/curvature_radius)
-        real(dl) scale !relative to flat. e.g. for scaling lSamp%l sampling.
+        real(dl) tau0, DMt0 !time today and comoving angular diameter distance to the big bang
+        real(dl) scale ! peak position scaling relative to fiducial (Planck). e.g. for scaling lSamp%l sampling.
+        real(dl) curv_flat_DM_ratio ! Ratio DMt0s/this%tau0, measures impact of curvature on geometry
 
         real(dl) akthom !sigma_T * (number density of protons now)
         real(dl) fHe !n_He_tot / n_H_tot
@@ -321,7 +333,9 @@
     logical, optional :: call_again, background_only
     logical WantReion, calling_again
     integer nu_i,actual_massless
-    real(dl) nu_massless_degeneracy, neff_i, eta_k, h2
+    real(dl) nu_massless_degeneracy, neff_i, eta_k, h2, nu_perturb_accuracy, max_nu_mass
+    real(dl), parameter :: massive_nu_transfer_q_boost_mass = 600._dl
+    real(dl), parameter :: massive_nu_transfer_q_5point_mass = 4300._dl
     real(dl) zpeak, sigma_z, zpeakstart, zpeakend
     Type(TRedWin), pointer :: Win
     logical back_only
@@ -476,9 +490,6 @@
         this%z_eq = (this%grhob+this%grhoc)/(this%grhog+this%grhornomass+sum(this%grhormass(1:this%CP%Nu_mass_eigenstates))) -1
 
         if (this%CP%omnuh2/=0) then
-            !Initialize things for massive neutrinos
-            call ThermalNuBackground%Init()
-            call this%NuPerturbations%Init(P%Accuracy%AccuracyBoost*P%Accuracy%neutrino_q_boost)
             !  nu_masses=m_nu(i)*c**2/(k_B*T_nu0)
             do nu_i=1, this%CP%Nu_mass_eigenstates
                 this%nu_masses(nu_i)= ThermalNuBackground%find_nu_mass_for_rho(this%CP%omnuh2/h2*this%CP%Nu_mass_fractions(nu_i)&
@@ -491,14 +502,27 @@
             end if
             !Just prevent divide by zero
             this%nu_masses(1:this%CP%Nu_mass_eigenstates) = max(this%nu_masses(1:this%CP%Nu_mass_eigenstates),1e-3_dl)
+            nu_perturb_accuracy = P%Accuracy%AccuracyBoost*P%Accuracy%neutrino_q_boost
+            if (AccuracyTarget > 0) then
+                ! Use 4 q points once massive neutrinos are nonrelativistic through the transfer range.
+                ! The heaviest transfer cases need the 5-point rule.
+                max_nu_mass = maxval(this%nu_masses(1:this%CP%Nu_mass_eigenstates))
+                if (max_nu_mass > massive_nu_transfer_q_5point_mass) then
+                    nu_perturb_accuracy = max(nu_perturb_accuracy, 2.001_dl)
+                else if (max_nu_mass > massive_nu_transfer_q_boost_mass) then
+                    nu_perturb_accuracy = max(nu_perturb_accuracy, 1.001_dl)
+                end if
+            end if
+            call this%NuPerturbations%Init(nu_perturb_accuracy)
         else
             this%nu_masses = 0
         end if
         call this%CP%DarkEnergy%Init(this)
         if (global_error_flag==0) this%tau0=this%TimeOfz(0._dl)
         if (global_error_flag==0) then
-            this%chi0=this%rofChi(this%tau0/this%curvature_radius)
-            this%scale= this%chi0*this%curvature_radius/this%tau0  !e.g. change l sampling depending on approx peak spacing
+            this%DMt0 = this%curvature_radius*this%rofChi(this%tau0/this%curvature_radius)
+            this%scale = 1._dl !set to actual measure of peak scale relative to fiducial later.
+            this%curv_flat_DM_ratio = this%DMt0/this%tau0
             if (this%closed .and. this%tau0/this%curvature_radius >3.14) then
                 call GlobalError('chi >= pi in closed model not supported',error_unsupported_params)
             end if
@@ -1233,7 +1257,7 @@
     if (this%CP%Num_Nu_massive /= 0) then
         !Get massive neutrino density relative to massless
         do nu_i = 1, this%CP%nu_mass_eigenstates
-            call ThermalNuBack%rho(a * this%nu_masses(nu_i), rhonu)
+            call ThermalNuBackground%rho(a * this%nu_masses(nu_i), rhonu)
             grhoa2 = grhoa2 + rhonu * this%grhormass(nu_i)
         end do
     end if
@@ -1340,15 +1364,22 @@
     integer, intent(IN) :: lmin,max_l
     integer lind, lvar, step, top, bot, lmin_log
     integer, allocatable :: ls(:)
-    real(dl) AScale
+    real(dl) AScale, growth
 
     allocate(ls(max_l))
     if (allocated(this%l)) deallocate(this%l)
     this%lmin = lmin
     this%use_spline_template = State%CP%use_cl_spline_template
+    this%template_l_scale = 1._dl
+    if (this%use_spline_template .and. abs(State%scale - 1._dl) > template_shift_scale_tol) &
+        this%template_l_scale = State%scale
     lmin_log = State%CP%min_l_logl_sampling
     associate(Accuracy => State%CP%Accuracy)
-        Ascale=State%scale/Accuracy%lSampleBoost
+        if (State%scale < 1._dl - near_flat_scale_tol) then
+            Ascale = State%scale/Accuracy%lSampleBoost
+        else
+            Ascale = 1._dl/Accuracy%lSampleBoost
+        end if
 
         if (Accuracy%lSampleBoost >=50) then
             !just do all of them
@@ -1376,6 +1407,15 @@
             end do
             if (Accuracy%lSampleBoost > 1) then
                 do lvar=15, 37, 1
+                    lind=lind+1
+                    ls(lind)=lvar
+                end do
+            else if (AccuracyTarget > 0 .and. State%CP%WantScalars) then
+                do lvar=15, 18, 1
+                    lind=lind+1
+                    ls(lind)=lvar
+                end do
+                do lvar=19, 37, 2
                     lind=lind+1
                     ls(lind)=lvar
                 end do
@@ -1475,22 +1515,32 @@
                     end do
 
                     if (max_l > lmin_log) then
-                        !Should be pretty smooth or tiny out here
-                        step=max(nint(400*Ascale),50)
+                        !Above lmin_log the unlensed C_L are smoothly damping. The default initial
+                        !step ~ 400 with 1.5x growth produces few, widely-spaced samples just above
+                        !lmin_log where the unlensed is not yet exponentially small, driving lensed
+                        !C_L interpolation errors. Use a smaller initial step and slower growth
+                        !when AccuracyTarget is on for lensed scalar CMB.
+                        if (AccuracyTarget > 0 .and. State%CP%Want_CMB .and. State%CP%WantScalars) then
+                            step=max(nint(100*Ascale),50)
+                            growth = 1.1_dl
+                        else
+                            step=max(nint(400*Ascale),50)
+                            growth = 1.5_dl
+                        end if
                         lvar = ls(lind)
                         do
                             lvar = lvar + step
                             if (lvar > max_l) exit
                             lind=lind+1
                             ls(lind)=lvar
-                            step = nint(step*1.5) !log spacing
+                            step = nint(step*growth) !log spacing
                         end do
-                        if (ls(lind) < max_l - 100) then
+                        if (ls(lind) < max_l - (State%CP%lens_output_margin - lens_convolution_gap)) then
                             !Try to keep lensed spectra up to specified lmax
                             lind=lind+1
-                            ls(lind)=max_l - lensed_convolution_margin
-                        else if (ls(lind) - ls(lind-1) > lensed_convolution_margin) then
-                            ls(lind)=max_l - lensed_convolution_margin
+                            ls(lind)=max_l - (State%CP%lens_output_margin - lens_convolution_gap)
+                        else if (ls(lind) - ls(lind-1) > State%CP%lens_output_margin - lens_convolution_gap) then
+                            ls(lind)=max_l - (State%CP%lens_output_margin - lens_convolution_gap)
                         end if
                     end if
                 end if !log_lvalues
@@ -1524,7 +1574,7 @@
     if (max_ind > lSet%nl) call MpiStop('Wrong max_ind in InterpolateClArr')
 
     xl = real(lSet%l(1:lSet%nl),dl)
-    call spline_def(xl,iCL,max_ind,ddCl)
+    call cubic_spline_second_derivs(xl,iCL,max_ind,ddCl)
 
     llo=1
     do il=lSet%lmin,lSet%l(max_ind)
@@ -1533,12 +1583,16 @@
             llo=llo+1
         end if
         lhi=llo+1
-        ho=lSet%l(lhi)-lSet%l(llo)
-        a0=(lSet%l(lhi)-xi)/ho
-        b0=(xi-lSet%l(llo))/ho
+        associate(llo_l => lSet%l(llo), lhi_l => lSet%l(lhi), &
+            iCl_llo => iCl(llo), iCl_lhi => iCl(lhi), &
+            ddCl_llo => ddCl(llo), ddCl_lhi => ddCl(lhi))
+            ho=lhi_l-llo_l
+            a0=(lhi_l-xi)/ho
+            b0=1._dl-a0
 
-        all_Cl(il) = a0*iCl(llo)+ b0*iCl(lhi)+((a0**3-a0)* ddCl(llo) &
-            +(b0**3-b0)*ddCl(lhi))*ho**2/6
+            all_Cl(il) = a0*iCl_llo + b0*iCl_lhi - a0*b0*((1._dl+a0)*ddCl_llo + &
+                (1._dl+b0)*ddCl_lhi)*ho*ho/6
+        end associate
     end do
 
     end subroutine InterpolateClArr
@@ -1549,9 +1603,10 @@
     real(dl), intent(out):: all_Cl(lSet%lmin:*)
     integer, intent(in) :: max_ind
     integer, intent(in), optional :: template_index
-    integer maxdelta, il
+    integer maxdelta, il, lo, hi
+    real(dl) template_scale, template_l, frac
     real(dl) DeltaCL(lSet%nl)
-    real(dl), allocatable :: tmpall(:)
+    real(dl), allocatable :: tmpall(:), template_cl(:)
 
     if (max_ind > lSet%nl) call MpiStop('Wrong max_ind in InterpolateClArrTemplated')
     if (lSet%use_spline_template .and. present(template_index)) then
@@ -1559,21 +1614,58 @@
             !interpolate only the difference between the C_l and an accurately interpolated template.
             !Using unlensed for template, seems to be good enough
             maxdelta=max_ind
-            do while (lSet%l(maxdelta) > lmax_extrap_highl)
-                maxdelta=maxdelta-1
-            end do
-            DeltaCL(1:maxdelta)=iCL(1:maxdelta)- highL_CL_template(lSet%l(1:maxdelta), template_index)
+            template_scale = lSet%template_l_scale
+            if (template_scale == 1._dl) then
+                do while (lSet%l(maxdelta) > lmax_extrap_highl)
+                    maxdelta=maxdelta-1
+                end do
+                DeltaCL(1:maxdelta)=iCL(1:maxdelta)- highL_CL_template(lSet%l(1:maxdelta), template_index)
 
-            call lSet%InterpolateClArr(DeltaCl, all_Cl, maxdelta)
+                call lSet%InterpolateClArr(DeltaCl, all_Cl, maxdelta)
 
-            do il=lSet%lmin,lSet%l(maxdelta)
-                all_Cl(il) = all_Cl(il) +  highL_CL_template(il,template_index)
-            end do
+                do il=lSet%lmin,lSet%l(maxdelta)
+                    all_Cl(il) = all_Cl(il) +  highL_CL_template(il,template_index)
+                end do
+            else
+                do while (maxdelta > 1 .and. lSet%l(maxdelta)/template_scale > lmax_extrap_highl)
+                    maxdelta=maxdelta-1
+                end do
+                if (lSet%l(maxdelta)/template_scale > lmax_extrap_highl) then
+                    call lSet%InterpolateClArr(iCl, all_Cl, max_ind)
+                    return
+                end if
+
+                allocate(template_cl(lSet%lmin:lSet%l(maxdelta)))
+                do il=lSet%lmin,lSet%l(maxdelta)
+                    template_l = real(il, dl)/template_scale
+                    if (template_l <= 1._dl) then
+                        template_cl(il) = highL_CL_template(1, template_index)
+                    else if (template_l >= lmax_extrap_highl) then
+                        template_cl(il) = highL_CL_template(lmax_extrap_highl, template_index)
+                    else
+                        lo = int(template_l)
+                        hi = lo + 1
+                        frac = template_l - lo
+                        template_cl(il) = (1._dl - frac)*highL_CL_template(lo, template_index) &
+                            + frac*highL_CL_template(hi, template_index)
+                    end if
+                end do
+                do il=1,maxdelta
+                    DeltaCL(il) = iCL(il) - template_cl(lSet%l(il))
+                end do
+
+                call lSet%InterpolateClArr(DeltaCl, all_Cl, maxdelta)
+
+                do il=lSet%lmin,lSet%l(maxdelta)
+                    all_Cl(il) = all_Cl(il) + template_cl(il)
+                end do
+                deallocate(template_cl)
+            end if
 
             if (maxdelta < max_ind) then
-                !directly interpolate high L where no t  emplate (doesn't effect lensing spectrum much anyway)
+                !directly interpolate high L where no template (doesn't effect lensing spectrum much anyway)
                 allocate(tmpall(lSet%lmin:lSet%l(max_ind)))
-                call InterpolateClArr(lSet,iCl, tmpall, max_ind)
+                call lSet%InterpolateClArr(iCl, tmpall, max_ind)
                 !overlap to reduce interpolation artefacts
                 all_cl(lSet%l(maxdelta-2):lSet%l(max_ind) ) = tmpall(lSet%l(maxdelta-2):lSet%l(max_ind))
                 deallocate(tmpall)
@@ -1582,7 +1674,7 @@
         end if
     end if
 
-    call InterpolateClArr(lSet,iCl, all_Cl, max_ind)
+    call lSet%InterpolateClArr(iCl, all_Cl, max_ind)
 
     end subroutine InterpolateClArrTemplated
 
@@ -1613,20 +1705,18 @@
             dopacity = this%ddotmu(this%nthermo)/(tau*this%dlntau)
         end if
     else
-        cs2b=this%cs2(i)+d*(this%dcs2(i)+d*(3*(this%cs2(i+1)-this%cs2(i))  &
-            -2*this%dcs2(i)-this%dcs2(i+1)+d*(this%dcs2(i)+this%dcs2(i+1)  &
-            +2*(this%cs2(i)-this%cs2(i+1)))))
-        opacity=this%dotmu(i)+d*(this%ddotmu(i)+d*(3*(this%dotmu(i+1)-this%dotmu(i)) &
-            -2*this%ddotmu(i)-this%ddotmu(i+1)+d*(this%ddotmu(i)+this%ddotmu(i+1) &
-            +2*(this%dotmu(i)-this%dotmu(i+1)))))
-        a = (this%ScaleFactor(i)+d*(this%dScaleFactor(i)+d*(3*(this%ScaleFactor(i+1)-this%ScaleFactor(i)) &
-            -2*this%dScaleFactor(i)-this%dScaleFactor(i+1)+d*(this%dScaleFactor(i)+this%dScaleFactor(i+1) &
-            +2*(this%ScaleFactor(i)-this%ScaleFactor(i+1))))))*tau
-        if (present(dopacity)) then
-            dopacity=(this%ddotmu(i)+d*(this%dddotmu(i)+d*(3*(this%ddotmu(i+1)  &
-                -this%ddotmu(i))-2*this%dddotmu(i)-this%dddotmu(i+1)+d*(this%dddotmu(i) &
-                +this%dddotmu(i+1)+2*(this%ddotmu(i)-this%ddotmu(i+1))))))/(tau*this%dlntau)
-        end if
+        associate(cs2_coeffs => this%thermo_horner(i)%cs2b, &
+            opacity_coeffs => this%thermo_horner(i)%opacity, &
+            a_coeffs => this%thermo_horner(i)%a, &
+            dopacity_coeffs => this%thermo_horner(i)%dopacity)
+            cs2b = cs2_coeffs(1) + d*(cs2_coeffs(2) + d*(cs2_coeffs(3) + d*cs2_coeffs(4)))
+            opacity = opacity_coeffs(1) + d*(opacity_coeffs(2) + d*(opacity_coeffs(3) + d*opacity_coeffs(4)))
+            a = (a_coeffs(1) + d*(a_coeffs(2) + d*(a_coeffs(3) + d*a_coeffs(4))))*tau
+            if (present(dopacity)) then
+                dopacity = (dopacity_coeffs(1) + d*(dopacity_coeffs(2) + d*(dopacity_coeffs(3) + &
+                    d*dopacity_coeffs(4))))/(tau*this%dlntau)
+            end if
+        end associate
     end if
     end subroutine Thermo_values
 
@@ -1647,17 +1737,14 @@
         a=1
         adot=this%adot(this%nthermo)
     else
-        a = (this%ScaleFactor(i)+d*(this%dScaleFactor(i)+d*(3*(this%ScaleFactor(i+1)-this%ScaleFactor(i)) &
-            -2*this%dScaleFactor(i)-this%dScaleFactor(i+1)+d*(this%dScaleFactor(i)+this%dScaleFactor(i+1) &
-            +2*(this%ScaleFactor(i)-this%ScaleFactor(i+1))))))*tau
-
-        adot = (this%adot(i)+d*(this%dadot(i)+d*(3*(this%adot(i+1)-this%adot(i)) &
-            -2*this%dadot(i)-this%dadot(i+1)+d*(this%dadot(i)+this%dadot(i+1) &
-            +2*(this%adot(i)-this%adot(i+1))))))
-
-        opacity=this%dotmu(i)+d*(this%ddotmu(i)+d*(3*(this%dotmu(i+1)-this%dotmu(i)) &
-            -2*this%ddotmu(i)-this%ddotmu(i+1)+d*(this%ddotmu(i)+this%ddotmu(i+1) &
-            +2*(this%dotmu(i)-this%dotmu(i+1)))))
+        associate(a_coeffs => this%thermo_horner(i)%a, &
+            opacity_coeffs => this%thermo_horner(i)%opacity)
+            a = (a_coeffs(1) + d*(a_coeffs(2) + d*(a_coeffs(3) + d*a_coeffs(4))))*tau
+            opacity = opacity_coeffs(1) + d*(opacity_coeffs(2) + d*(opacity_coeffs(3) + d*opacity_coeffs(4)))
+            adot = (this%adot(i)+d*(this%dadot(i)+d*(3*(this%adot(i+1)-this%adot(i)) &
+                -2*this%dadot(i)-this%dadot(i+1)+d*(this%dadot(i)+this%dadot(i+1) &
+                +2*(this%adot(i)-this%adot(i+1))))))
+        end associate
     end if
 
     end subroutine Thermo_expansion_values
@@ -1706,9 +1793,13 @@
     integer RW_i, j2
     real(dl) Tb21cm, winamp, z, background_boost
     character(len=:), allocatable :: outstr
-    real(dl), allocatable ::  taus(:)
+    real(dl), allocatable ::  taus(:), dcs2(:)
     real(dl), allocatable :: xe_a(:), sdotmu(:), opts(:)
+    real(dl) dSF1, dSF2, delta, sf1, sf2
     real(dl), allocatable :: scale_factors(:), times(:), dt(:)
+    ! Thermodynamic sound-speed temporaries.
+    real(dl) :: T_reion, denom, yheat, Tg, muinv, cs2_orig, cs2_heat, Tb_orig, xe_HHeI
+    logical :: thermo_use_omp
     Type(TCubicSpline) :: dotmuSp
     integer ninverse, nlin
     real(dl) dlna, zstar_min, zstar_max
@@ -1716,10 +1807,13 @@
     Type(CAMBParams), pointer :: CP
 
     CP => State%CP
+    thermo_use_omp = .false.
+    !$ thermo_use_omp = omp_get_max_threads() > 1
+    this%has_lensing_windows = .false.
 
     !Allocate memory outside parallel region to keep ifort happy
     background_boost = CP%Accuracy%BackgroundTimeStepBoost*CP%Accuracy%AccuracyBoost
-    if (background_boost > 20) then
+    if (background_boost > 20 .and. print_fortran_warnings) then
         write(*,*) 'Warning: very small time steps can give less accurate spline derivatives'
         write(*,*) 'e.g. around reionization if not matched very smoothly'
     end if
@@ -1740,20 +1834,22 @@
         end associate
     end do
     this%nthermo = nthermo
-    allocate(spline_data(nthermo), sdotmu(nthermo))
+    allocate(spline_data(nthermo), sdotmu(nthermo), dcs2(nthermo))
 
     if (allocated(this%tb) .and. this%nthermo/=size(this%tb)) then
-        deallocate(this%scaleFactor, this%cs2, this%dcs2, this%ddotmu)
-        deallocate(this%dscaleFactor, this%adot, this%dadot)
+        deallocate(this%scaleFactor, this%cs2, this%ddotmu)
+        deallocate(this%adot, this%dadot)
         deallocate(this%tb, this%xe, this%emmu, this%dotmu)
         deallocate(this%demmu, this%dddotmu, this%ddddotmu)
+        deallocate(this%thermo_horner)
         if (dowinlens .and. allocated(this%winlens)) deallocate(this%winlens, this%dwinlens)
     endif
     if (.not. allocated(this%tb)) then
-        allocate(this%scaleFactor(nthermo), this%cs2(nthermo), this%dcs2(nthermo), this%ddotmu(nthermo))
-        allocate(this%dscaleFactor(nthermo), this%adot(nthermo), this%dadot(nthermo))
+        allocate(this%scaleFactor(nthermo), this%cs2(nthermo), this%ddotmu(nthermo))
+        allocate(this%adot(nthermo), this%dadot(nthermo))
         allocate(this%tb(nthermo), this%xe(nthermo), this%emmu(nthermo),this%dotmu(nthermo))
         allocate(this%demmu(nthermo), this%dddotmu(nthermo), this%ddddotmu(nthermo))
+        allocate(this%thermo_horner(nthermo))
         if (dowinlens) allocate(this%winlens(nthermo), this%dwinlens(nthermo))
     end if
 
@@ -1763,7 +1859,6 @@
         allocate(RW(State%num_redshiftwindows))
     end if
 
-
     do RW_i = 1, State%num_redshiftwindows
         associate (RedWin => State%Redshift_w(RW_i))
             RedWin%tau_start = 0
@@ -1771,6 +1866,7 @@
             if (RedWin%kind == window_lensing .or.  RedWin%kind == window_counts .and. CP%SourceTerms%counts_lensing) then
                 allocate(RW(RW_i)%awin_lens(nthermo))
                 allocate(RW(RW_i)%dawin_lens(nthermo))
+                RW(RW_i)%awin_lens(1) = 0
             end if
         end associate
     end do
@@ -1786,9 +1882,9 @@
     allocate(dt(ninverse+nlin))
     allocate(taus(nthermo), xe_a(nthermo))
 
-    !$OMP PARALLEL SECTIONS DEFAULT(SHARED)
+    !$OMP PARALLEL SECTIONS DEFAULT(SHARED) NUM_THREADS(2) IF(thermo_use_omp)
     !$OMP SECTION
-    call CP%Recomb%Init(State,WantTSpin=CP%Do21cm)    !almost all the time spent here
+    call CP%Recomb%Init(State,WantTSpin=CP%Do21cm)  ! slowest individual step
 
     if (CP%Evolve_delta_xe) this%recombination_saha_tau  = State%TimeOfZ(CP%Recomb%get_saha_z(), tol=1e-4_dl)
     if (CP%Evolve_baryon_cs .or. CP%Evolve_delta_xe .or. CP%Evolve_delta_Ts .or. CP%Do21cm) &
@@ -1800,7 +1896,7 @@
     awin_lens2=0
     transfer_ix =0
 
-    call splini(spline_data,nthermo)
+    call init_unit_grid_pade_derivative(spline_data,nthermo)
 
     this%tight_tau = 0
     this%actual_opt_depth = 0
@@ -1811,7 +1907,8 @@
     last_dotmu = 0
 
     this%matter_verydom_tau = 0
-    a_verydom = CP%Accuracy%AccuracyBoost*5*(State%grhog+State%grhornomass)/(State%grhoc+State%grhob)
+    a_verydom = CP%Accuracy%AccuracyBoost*CP%Accuracy%TimeSwitchBoost &
+        *5*(State%grhog+State%grhornomass)/(State%grhoc+State%grhob)
     if (CP%Reion%Reionization) then
         call CP%Reion%get_timesteps(State%reion_n_steps, reion_z_start, reion_z_complete)
         State%reion_tau_start = max(0.05_dl, State%TimeOfZ(reion_z_start, 1d-3))
@@ -1858,6 +1955,10 @@
     this%scaleFactor(1) = a0
     this%scaleFactor(nthermo) = 1
     this%adot(1) = 1/dtauda(State,a0)
+    if (State%num_redshiftwindows >0) then
+        this%redshift_time(1) = 1._dl/a0 - 1._dl
+        this%arhos_fac(1) = 0
+    end if
 
     tau01=this%tauminn
     do i=2,nthermo
@@ -1874,6 +1975,7 @@
         z= 1._dl/a-1._dl
         if (State%num_redshiftwindows>0) then
             this%redshift_time(i) = z
+            if (a <= 1d-4) this%arhos_fac(i) = 0
             do RW_i = 1, State%num_redshiftwindows
                 associate (Win => RW(RW_i), RedWin => State%Redshift_w(RW_i))
                     if (a > 1d-4) then
@@ -1920,10 +2022,14 @@
         associate(Win => RW(RW_i))
             if (State%Redshift_w(RW_i)%kind == window_lensing .or. &
                 State%Redshift_w(RW_i)%kind == window_counts .and. CP%SourceTerms%counts_lensing) then
-                this%has_lensing_windows = .true.
-                State%Redshift_w(RW_i)%has_lensing_window = .true.
-                if (FeedbackLevel>0)  write(*,'(I1," Int W              = ",f9.6)') RW_i, awin_lens1(RW_i)
-                Win%awin_lens=Win%awin_lens/awin_lens1(RW_i)
+                if (awin_lens1(RW_i) /= 0._dl) then
+                    this%has_lensing_windows = .true.
+                    State%Redshift_w(RW_i)%has_lensing_window = .true.
+                    if (FeedbackLevel>0)  write(*,'(I1," Int W              = ",f9.6)') RW_i, awin_lens1(RW_i)
+                    Win%awin_lens=Win%awin_lens/awin_lens1(RW_i)
+                else
+                    State%Redshift_w(RW_i)%has_lensing_window = .false.
+                end if
             else
                 State%Redshift_w(RW_i)%has_lensing_window = .false.
             end if
@@ -1931,7 +2037,13 @@
     end do
     !$OMP END PARALLEL SECTIONS
 
-    if (global_error_flag/=0) return
+    if (global_error_flag/=0) then
+        if (State%num_redshiftwindows >0) then
+            deallocate(this%arhos_fac, this%darhos_fac, this%ddarhos_fac)
+            deallocate(this%redshift_time, this%dredshift_time)
+        end if
+        return
+    end if
 
     call CP%Recomb%xe_tm(a0,this%xe(1), this%tb(1))
     barssc=barssc0*(1._dl-0.75d0*CP%yhe+(1._dl-CP%yhe)*this%xe(1))
@@ -1939,7 +2051,7 @@
     this%dotmu(1)=this%xe(1)*State%akthom/a0**2
 
 
-    !$OMP PARALLEL DO DEFAULT(SHARED), SCHEDULE(STATIC,16)
+    !$OMP PARALLEL DO DEFAULT(SHARED), SCHEDULE(STATIC,16) NUM_THREADS(2) IF(thermo_use_omp)
     do i=2,nthermo
         call CP%Recomb%xe_tm(this%scaleFactor(i), xe_a(i), this%tb(i))
     end do
@@ -1985,17 +2097,45 @@
             this%xe(i)=xe_a(i)
         end if
 
-        !  approximate Baryon sound speed squared (over c**2).
-        !  Use pre-reionization ionization fraction for cs2-related terms for consistency
-        !  (not correct, but avoids odd behaviour at very high k)
-        !  https://github.com/cmbant/CAMB/issues/171
         fe=(1._dl-CP%yhe)*xe_a(i)/(1._dl-0.75d0*CP%yhe+(1._dl-CP%yhe)*xe_a(i))
         dtbdla=-2._dl*this%tb(i)
         if (a*this%tb(i)-CP%tcmb < -1e-8) then
             dtbdla= dtbdla -thomc0*fe/adot*(a*this%tb(i)-CP%tcmb)/a**3
         end if
         barssc=barssc0*(1._dl-0.75d0*CP%yhe+(1._dl-CP%yhe)*xe_a(i))
-        this%cs2(i)=barssc*this%tb(i)*(1-dtbdla/this%tb(i)/3._dl)
+        cs2_orig = barssc*this%tb(i)*(1-dtbdla/this%tb(i)/3._dl)
+
+        Tb_orig = this%tb(i)
+        if (CP%Reion%Reionization .and. CP%Reion%include_heating .and. tau > State%reion_tau_start) then
+            ! Reionization heating model: smoothly raise Tb to T_reion following x_e shape
+            ! and map cs^2 smoothly from the original formula to ideal-gas form.
+            ! Use mu^{-1} = (1 - 0.75 Y_He) + (1 - Y_He) x_e.
+            T_reion = CP%Reion%reion_temperature
+            ! yheat follows the H + first-He reionization x_e shape: 0 before reionization,
+            ! ->1 when x_e reaches 1 + fHe (hydrogen and first helium fully ionized). These are
+            ! assumed to track each other in the default model, so heating completes together
+            ! with them rather than partway through (when x_e~1) as it would if normalized to 1.
+            xe_HHeI = 1._dl + State%fHe
+            denom = max(1.0d-12, xe_HHeI - xe_a(i))
+            yheat = (this%xe(i) - xe_a(i))/denom
+            if (yheat < 0) yheat = 0
+            if (yheat > 1) yheat = 1
+            if (yheat > 0) then
+                Tg = Tb_orig + yheat*(T_reion - Tb_orig)
+                muinv = (1._dl-0.75d0*CP%yhe+(1._dl-CP%yhe)*this%xe(i))
+                cs2_heat = (5._dl/3._dl) * barssc0 * muinv * Tg
+                ! Smooth mapping
+                this%cs2(i) = (1._dl - yheat)*cs2_orig + yheat*cs2_heat
+            else
+                this%cs2(i) = cs2_orig
+            end if
+        else
+            !  Approximate Baryon sound speed squared (over c**2).
+            !  Use pre-reionization ionization fraction for cs2-related terms for consistency
+            !  (not correct, but avoids odd behaviour at very high k)
+            !  https://github.com/cmbant/CAMB/issues/171
+            this%cs2(i) = cs2_orig
+        end if
 
         ! Calculation of the visibility function
         this%dotmu(i)=this%xe(i)*State%akthom/a2
@@ -2004,7 +2144,7 @@
         !Tight coupling switch time when k/opacity is smaller than 1/(tau*opacity)
     end do
 
-    if (CP%Reion%Reionization .and. (this%xe(nthermo) < 0.999d0)) then
+    if (CP%Reion%Reionization .and. (this%xe(nthermo) < 0.999d0) .and. print_fortran_warnings) then
         write(*,*)'Warning: xe at redshift zero is < 1'
         write(*,*) 'Check input parameters an Reionization_xe'
         write(*,*) 'function in the Reionization module'
@@ -2089,7 +2229,11 @@
     end do
 
     if (iv /= 2) then
-        call GlobalError('ThemoData Init: failed to find end of recombination',error_reionization)
+        call GlobalError('ThermoData Init: failed to find end of recombination',error_reionization)
+        if (State%num_redshiftwindows >0) then
+            deallocate(this%arhos_fac, this%darhos_fac, this%ddarhos_fac)
+            deallocate(this%redshift_time, this%dredshift_time)
+        end if
         return
     end if
 
@@ -2100,7 +2244,7 @@
         this%winlens=0
         do j1=1,nthermo-1
             vis = this%emmu(j1)*this%dotmu(j1)
-            tau = this%tauminn* taus(j1)
+            tau = taus(j1)
             vfi=vfi+vis*cf1*this%dlntau*tau
             if (vfi < 0.995) then
                 dwing_lens =  vis*cf1*this%dlntau*tau / 0.995
@@ -2127,36 +2271,73 @@
         write (*,*) 'taurst, taurend = ', State%taurst, State%taurend
     end if
 
-    !$OMP PARALLEL SECTIONS DEFAULT(SHARED)
+    !$OMP PARALLEL SECTIONS DEFAULT(SHARED), PRIVATE(j2, sf1, sf2, dSF1, dSF2, delta) &
+    !$OMP NUM_THREADS(2) IF(thermo_use_omp)
     !$OMP SECTION
-    call splder(this%dotmu,this%ddotmu,nthermo,spline_data)
-    call splder(this%ddotmu,this%dddotmu,nthermo,spline_data)
-    call splder(this%dddotmu,this%ddddotmu,nthermo,spline_data)
+    call unit_grid_pade_derivative(this%dotmu,this%ddotmu,nthermo,spline_data)
+    call unit_grid_pade_derivative(this%ddotmu,this%dddotmu,nthermo,spline_data)
+    call unit_grid_pade_derivative(this%dddotmu,this%ddddotmu,nthermo,spline_data)
+    do j2 = 1, nthermo - 1
+        associate(horner => this%thermo_horner(j2))
+            horner%opacity(1) = this%dotmu(j2)
+            horner%opacity(2) = this%ddotmu(j2)
+            horner%opacity(3) = 3*(this%dotmu(j2+1) - this%dotmu(j2)) - 2*this%ddotmu(j2) - this%ddotmu(j2+1)
+            horner%opacity(4) = this%ddotmu(j2) + this%ddotmu(j2+1) + 2*(this%dotmu(j2) - this%dotmu(j2+1))
+
+            horner%dopacity(1) = this%ddotmu(j2)
+            horner%dopacity(2) = this%dddotmu(j2)
+            horner%dopacity(3) = 3*(this%ddotmu(j2+1) - this%ddotmu(j2)) - 2*this%dddotmu(j2) - this%dddotmu(j2+1)
+            horner%dopacity(4) = this%dddotmu(j2) + this%dddotmu(j2+1) + 2*(this%ddotmu(j2) - this%ddotmu(j2+1))
+        end associate
+    end do
     if (CP%want_zstar .or. CP%WantDerivedParameters) &
         this%z_star = State%binary_search(noreion_optdepth, 1.d0, zstar_min, zstar_max, &
         & 1d-3/background_boost, 100._dl*z_scale, 4000._dl*z_scale)
-    !$OMP SECTION
-    call splder(this%cs2,this%dcs2,nthermo,spline_data)
-    call splder(this%emmu,this%demmu,nthermo,spline_data)
-    call splder(this%adot,this%dadot,nthermo,spline_data)
-    if (dowinlens) call splder(this%winlens,this%dwinlens,nthermo,spline_data)
-    if (CP%want_zdrag .or. CP%WantDerivedParameters) &
-        this%z_drag = State%binary_search(dragoptdepth, 1.d0, 800*z_scale, &
-        & max(zstar_max*1.1_dl,1200._dl*z_scale), 2d-3/background_boost, 100.d0*z_scale, 4000._dl*z_scale)
-    !$OMP SECTION
-    this%ScaleFactor(:) = this%scaleFactor/taus !a/tau
-    this%dScaleFactor(:) = (this%adot - this%ScaleFactor)*this%dlntau !derivative of a/tau
+    this%ScaleFactor(:) = this%ScaleFactor/taus !a/tau for dynamic range
+    sf1  = this%ScaleFactor(1)
+    dSF1 = (this%adot(1) - sf1)*this%dlntau
+    do j2 = 1, nthermo - 1
+        sf2  = this%ScaleFactor(j2+1)
+        dSF2 = (this%adot(j2+1) - sf2)*this%dlntau
+        delta = sf2 - sf1
+        associate(a => this%thermo_horner(j2)%a)
+            a(1) = sf1
+            a(2) = dSF1
+            a(3) = 3*delta - 2*dSF1 - dSF2
+            a(4) = dSF1 + dSF2 - 2*delta
+        end associate
+        sf1  = sf2
+        dSF1 = dSF2
+    end do
     if (State%num_redshiftwindows >0) then
-        call splder(this%redshift_time,this%dredshift_time,nthermo,spline_data)
-        call splder(this%arhos_fac,this%darhos_fac,nthermo,spline_data)
-        call splder(this%darhos_fac,this%ddarhos_fac,nthermo,spline_data)
+        call unit_grid_pade_derivative(this%redshift_time,this%dredshift_time,nthermo,spline_data)
+        call unit_grid_pade_derivative(this%arhos_fac,this%darhos_fac,nthermo,spline_data)
+        call unit_grid_pade_derivative(this%darhos_fac,this%ddarhos_fac,nthermo,spline_data)
         do j2 = 1, State%num_redshiftwindows
             if (State%Redshift_w(j2)%has_lensing_window) then
-                call splder(RW(j2)%awin_lens,RW(j2)%dawin_lens,nthermo,spline_data)
+                call unit_grid_pade_derivative(RW(j2)%awin_lens,RW(j2)%dawin_lens,nthermo,spline_data)
             end if
         end do
     end if
     call this%SetTimeSteps(State,State%TimeSteps)
+    !$OMP SECTION
+    call unit_grid_pade_derivative(this%cs2,dcs2,nthermo,spline_data)
+    call unit_grid_pade_derivative(this%emmu,this%demmu,nthermo,spline_data)
+    call unit_grid_pade_derivative(this%adot,this%dadot,nthermo,spline_data)
+    do j2 = 1, nthermo - 1
+        associate(horner => this%thermo_horner(j2))
+            horner%cs2b(1) = this%cs2(j2)
+            horner%cs2b(2) = dcs2(j2)
+            horner%cs2b(3) = 3*(this%cs2(j2+1) - this%cs2(j2)) - 2*dcs2(j2) - dcs2(j2+1)
+            horner%cs2b(4) = dcs2(j2) + dcs2(j2+1) + 2*(this%cs2(j2) - this%cs2(j2+1))
+        end associate
+    end do
+    if (dowinlens) call unit_grid_pade_derivative(this%winlens,this%dwinlens,nthermo,spline_data)
+    if (CP%want_zdrag .or. CP%WantDerivedParameters .or. CP%WantCls) &
+        this%z_drag = State%binary_search(dragoptdepth, 1.d0, 800*z_scale, &
+        & max(zstar_max*1.1_dl,1200._dl*z_scale), 2d-3/background_boost, 100.d0*z_scale, 4000._dl*z_scale)
+    if (this%z_drag > 0) rs = State%sound_horizon(this%z_drag)
+    if (this%z_drag > 0 .and. State%DMt0 > 0) State%scale = planck2018_drag_angle/(rs/State%DMt0)
     !$OMP END PARALLEL SECTIONS
 
     if (State%num_redshiftwindows>0) then
@@ -2170,25 +2351,22 @@
 
     if (CP%WantDerivedParameters) then
         associate(ThermoDerivedParams => State%ThermoDerivedParams)
-            !$OMP PARALLEL SECTIONS DEFAULT(SHARED)
+            !$OMP PARALLEL SECTIONS DEFAULT(SHARED) NUM_THREADS(2) IF(thermo_use_omp)
             !$OMP SECTION
             ThermoDerivedParams( derived_Age ) = State%DeltaPhysicalTimeGyr(0.0_dl,1.0_dl)
             rstar =State%sound_horizon(this%z_star)
             ThermoDerivedParams( derived_rstar ) = rstar
             DA = State%AngularDiameterDistance(this%z_star)/(1/(this%z_star+1))
             ThermoDerivedParams( derived_zdrag ) = this%z_drag
-            !$OMP SECTION
-            rs =State%sound_horizon(this%z_drag)
-            ThermoDerivedParams( derived_rdrag ) = rs
-            ThermoDerivedParams( derived_kD ) =  &
-                sqrt(1.d0/(Integrate_Romberg(State,ddamping_da, 1d-8, 1/(this%z_star+1), 1d-6)/6))
-            !$OMP SECTION
             ThermoDerivedParams( derived_zEQ ) = State%z_eq
             a_eq = 1/(1+State%z_eq)
             ThermoDerivedParams( derived_kEQ ) = 1/(a_eq*dtauda(State,a_eq))
             rs_eq = State%sound_horizon(State%z_eq)
             tau_eq = State%timeOfz(State%z_eq)
             !$OMP SECTION
+            ThermoDerivedParams( derived_rdrag ) = rs
+            ThermoDerivedParams( derived_kD ) =  &
+                sqrt(1.d0/(Integrate_Romberg(State,ddamping_da, 1d-8, 1/(this%z_star+1), 1d-6)/6))
             !$OMP END PARALLEL SECTIONS
 
             ThermoDerivedParams( derived_zstar ) = this%z_star
@@ -2266,6 +2444,45 @@
     end if
 
     this%HasThermoData = .true.
+
+    contains
+
+    subroutine unit_grid_pade_derivative(y,dy,n,g)
+    !Fits a cubic spline to y and returns dy/di at the grid points.
+    integer, intent(in) :: n
+    real(dl), intent(in) :: y(n),g(n)
+    real(dl), intent(out) :: dy(n)
+    integer :: n1, i
+    real(dl), allocatable, dimension(:) :: f
+
+    allocate(f(n))
+    n1=n-1
+    !Quartic fit to dy/di at boundaries, assuming d3y/di3=0.
+    f(1)=(-10._dl*y(1)+15._dl*y(2)-6._dl*y(3)+y(4))/6._dl
+    f(n)=(10._dl*y(n)-15._dl*y(n1)+6._dl*y(n-2)-y(n-3))/6._dl
+    !Solve the tridiagonal system.
+    do i=2,n1
+        f(i)=g(i)*(3._dl*(y(i+1)-y(i-1))-f(i-1))
+    end do
+    dy(n)=f(n)
+    do i=n1,1,-1
+        dy(i)=f(i)-g(i)*dy(i+1)
+    end do
+
+    end subroutine unit_grid_pade_derivative
+
+    subroutine init_unit_grid_pade_derivative(g,n)
+    integer, intent(in) :: n
+    real(dl), intent(out):: g(n)
+    integer :: i
+
+    g(1)=0._dl
+    do i=2,n
+        g(i)=1/(4._dl-g(i-1))
+    end do
+
+    end subroutine init_unit_grid_pade_derivative
+
     end subroutine Thermo_Init
 
 
@@ -2350,7 +2567,7 @@
 
 
     if (State%CP%Reion%Reionization) then
-        nri0=int(State%reion_n_steps*State%CP%Accuracy%AccuracyBoost)
+        nri0=int(State%reion_n_steps * TimeSampleBoost)
         !Steps while reionization going from zero to maximum
         call TimeSteps%Add(State%reion_tau_start,State%reion_tau_complete,nri0)
     end if
@@ -2520,39 +2737,37 @@
         associate (RedWin => State%Redshift_W(i))
 
             ! int (a*rho_s/H)' a W_f(a) d\eta, or for counts int g/chi deta
-            call spline_def(TimeSteps%points(jstart:),int_tmp(jstart:,i),ninterp,tmp)
-            call spline_integrate(TimeSteps%points(jstart:),int_tmp(jstart:,i),tmp, tmp2(jstart:),ninterp)
+            call cubic_spline_second_derivs(TimeSteps%points(jstart:),int_tmp(jstart:,i),ninterp,tmp)
+            call cubic_spline_integral_array(TimeSteps%points(jstart:),int_tmp(jstart:,i),tmp, tmp2(jstart:),ninterp)
             RedWin%WinV(jstart:TimeSteps%npoints) =  &
                 RedWin%WinV(jstart:TimeSteps%npoints) + tmp2(jstart:TimeSteps%npoints)
 
-            call spline_def(TimeSteps%points(jstart:),RedWin%WinV(jstart:),ninterp,RedWin%ddWinV(jstart:))
-            call spline_deriv(TimeSteps%points(jstart:),RedWin%WinV(jstart:),RedWin%ddWinV(jstart:), RedWin%dWinV(jstart:), ninterp)
+            call cubic_spline_derivatives(TimeSteps%points(jstart:), RedWin%WinV(jstart:), ninterp, &
+                RedWin%ddWinV(jstart:), RedWin%dWinV(jstart:))
 
-            call spline_def(TimeSteps%points(jstart:),RedWin%Wing(jstart:),ninterp,RedWin%ddWing(jstart:))
-            call spline_deriv(TimeSteps%points(jstart:),RedWin%Wing(jstart:),RedWin%ddWing(jstart:), RedWin%dWing(jstart:), ninterp)
+            call cubic_spline_derivatives(TimeSteps%points(jstart:), RedWin%Wing(jstart:), ninterp, &
+                RedWin%ddWing(jstart:), RedWin%dWing(jstart:))
 
-            call spline_def(TimeSteps%points(jstart:),RedWin%Wing2(jstart:),ninterp,RedWin%ddWing2(jstart:))
-            call spline_deriv(TimeSteps%points(jstart:),RedWin%Wing2(jstart:),RedWin%ddWing2(jstart:), &
-                RedWin%dWing2(jstart:), ninterp)
+            call cubic_spline_derivatives(TimeSteps%points(jstart:), RedWin%Wing2(jstart:), ninterp, &
+                RedWin%ddWing2(jstart:), RedWin%dWing2(jstart:))
 
-            call spline_integrate(TimeSteps%points(jstart:),RedWin%Wing(jstart:), &
+            call cubic_spline_integral_array(TimeSteps%points(jstart:),RedWin%Wing(jstart:), &
                 RedWin%ddWing(jstart:), RedWin%WinF(jstart:),ninterp)
             RedWin%Fq = RedWin%WinF(TimeSteps%npoints)
 
             if (RedWin%kind == window_21cm) then
-                call spline_integrate(TimeSteps%points(jstart:),RedWin%Wing2(jstart:),&
+                call cubic_spline_integral_array(TimeSteps%points(jstart:),RedWin%Wing2(jstart:),&
                     RedWin%ddWing2(jstart:), tmp(jstart:),ninterp)
                 RedWin%optical_depth_21 = tmp(TimeSteps%npoints) / (State%CP%TCMB*1000)
                 !WinF not used.. replaced below
 
-                call spline_def(TimeSteps%points(jstart:),RedWin%Wingtau(jstart:),ninterp,RedWin%ddWingtau(jstart:))
-                call spline_deriv(TimeSteps%points(jstart:),RedWin%Wingtau(jstart:),RedWin%ddWingtau(jstart:), &
-                    RedWin%dWingtau(jstart:), ninterp)
+                call cubic_spline_derivatives(TimeSteps%points(jstart:), RedWin%Wingtau(jstart:), ninterp, &
+                    RedWin%ddWingtau(jstart:), RedWin%dWingtau(jstart:))
             elseif (RedWin%kind == window_counts) then
 
                 if (State%CP%SourceTerms%counts_evolve) then
-                    call spline_def(TimeSteps%points(jstart:),back_count_tmp(jstart:,i),ninterp,tmp)
-                    call spline_deriv(TimeSteps%points(jstart:),back_count_tmp(jstart:,i),tmp,tmp2(jstart:),ninterp)
+                    call cubic_spline_derivatives(TimeSteps%points(jstart:), back_count_tmp(jstart:,i), ninterp, tmp, &
+                        tmp2(jstart:))
                     do ix = jstart, TimeSteps%npoints
                         if (RedWin%Wing(ix)==0._dl) then
                             RedWin%Wingtau(ix) = 0
@@ -2566,8 +2781,8 @@
                     end do
 
                     !comoving_density_ev is d log(a^3 n_s)/d eta * window
-                    call spline_def(TimeSteps%points(jstart:),RedWin%comoving_density_ev(jstart:),ninterp,tmp)
-                    call spline_deriv(TimeSteps%points(jstart:),RedWin%comoving_density_ev(jstart:),tmp,tmp2(jstart:),ninterp)
+                    call cubic_spline_derivatives(TimeSteps%points(jstart:), RedWin%comoving_density_ev(jstart:), &
+                        ninterp, tmp, tmp2(jstart:))
                     do ix = jstart, TimeSteps%npoints
                         if (RedWin%Wing(ix)==0._dl) then
                             RedWin%comoving_density_ev(ix) = 0
@@ -2579,8 +2794,8 @@
                     end do
                 else
                     RedWin%comoving_density_ev=0
-                    call spline_def(TimeSteps%points(jstart:),hubble_tmp(jstart:),ninterp,tmp)
-                    call spline_deriv(TimeSteps%points(jstart:),hubble_tmp(jstart:),tmp, tmp2(jstart:), ninterp)
+                    call cubic_spline_derivatives(TimeSteps%points(jstart:), hubble_tmp(jstart:), ninterp, tmp, &
+                        tmp2(jstart:))
 
                     !assume d( a^3 n_s) of background population is zero, so remaining terms are
                     !wingtau =  g*(2/H\chi + Hdot/H^2)  when s=0; int_tmp = window/chi
@@ -2592,13 +2807,11 @@
                         *RedWin%Wing(jstart:TimeSteps%npoints)
                 endif
 
-                call spline_def(TimeSteps%points(jstart:),RedWin%Wingtau(jstart:),ninterp, &
-                    RedWin%ddWingtau(jstart:))
-                call spline_deriv(TimeSteps%points(jstart:),RedWin%Wingtau(jstart:),RedWin%ddWingtau(jstart:), &
-                    RedWin%dWingtau(jstart:), ninterp)
+                call cubic_spline_derivatives(TimeSteps%points(jstart:), RedWin%Wingtau(jstart:), ninterp, &
+                    RedWin%ddWingtau(jstart:), RedWin%dWingtau(jstart:))
 
                 !WinF is int[ g*(...)]
-                call spline_integrate(TimeSteps%points(jstart:),RedWin%Wingtau(jstart:),&
+                call cubic_spline_integral_array(TimeSteps%points(jstart:),RedWin%Wingtau(jstart:),&
                     RedWin%ddWingtau(jstart:), RedWin%WinF(jstart:),ninterp)
             end if
         end associate
@@ -2668,6 +2881,8 @@
                         -2._dl*C%dawin_lens(i)-C%dawin_lens(i+1)+d*(C%dawin_lens(i)+C%dawin_lens(i+1) &
                         +2._dl*(C%awin_lens(i)-C%awin_lens(i+1)))))
                 end associate
+            else
+                State%Redshift_W(RW_i)%win_lens(j2)=0
             end if
         end do
 
@@ -3279,7 +3494,7 @@
     integer i
 
     do i = 1,PK_Data%num_z
-        call spline_def(PK_data%log_kh,PK_data%matpower(:,i),PK_data%num_k,&
+        call cubic_spline_second_derivs(PK_data%log_kh,PK_data%matpower(:,i),PK_data%num_k,&
             PK_data%ddmat(:,i))
     end do
 
@@ -3291,11 +3506,11 @@
     integer i
 
     do i = 1,PK_Data%num_z
-        call spline_def(PK_data%log_k,PK_data%matpower(:,i),PK_data%num_k,&
+        call cubic_spline_second_derivs(PK_data%log_k,PK_data%matpower(:,i),PK_data%num_k,&
             PK_data%ddmat(:,i))
-        call spline_def(PK_data%log_k,PK_data%vvpower(:,i),PK_data%num_k,&
+        call cubic_spline_second_derivs(PK_data%log_k,PK_data%vvpower(:,i),PK_data%num_k,&
             PK_data%ddvvpower(:,i))
-        call spline_def(PK_data%log_k,PK_data%vdpower(:,i),PK_data%num_k,&
+        call cubic_spline_second_derivs(PK_data%log_k,PK_data%vdpower(:,i),PK_data%num_k,&
             PK_data%ddvdpower(:,i))
     end do
 
@@ -3339,8 +3554,14 @@
             ( PK%log_kh(2)-PK%log_kh(1) )
         outpower = PK%matpower(1,itf) + dp*(logk - PK%log_kh(1))
     else if (logk > PK%log_kh(PK%num_k)) then
-        !Do dodgy linear extrapolation on assumption accuracy of result won't matter
+        if (PK%matpower(PK%num_k,itf) >= PK%matpower(PK%num_k-1,itf)) then
+            call GlobalError(FormatString('MatterPowerData_k: cannot extrapolate rising high-k matter power tail' // &
+                ' from k/h=%f to requested k/h=%f', exp(PK%log_kh(PK%num_k)), kh), error_nonlinear)
+            outpower = 0
+            return
+        end if
 
+        !Do dodgy linear extrapolation on assumption accuracy of result won't matter
         dp = (PK%matpower(PK%num_k,itf) -  PK%matpower(PK%num_k-1,itf)) / &
             ( PK%log_kh(PK%num_k)-PK%log_kh(PK%num_k-1) )
         outpower = PK%matpower(PK%num_k,itf) + dp*(logk - PK%log_kh(PK%num_k))
@@ -3485,7 +3706,7 @@
     if (npoints < 2) call MpiStop('Need at least 2 points in Transfer_GetMatterPower')
 
     if (minkh*exp((npoints-1)*dlnkh) > MTrans%TransferData(Transfer_kh,MTrans%num_q_trans,itf) &
-        .and. FeedbackLevel > 0 ) &
+        .and. FeedbackLevel > 0 .and. print_fortran_warnings) &
         write(*,*) 'Warning: extrapolating matter power in Transfer_GetMatterPower'
 
 
@@ -3515,7 +3736,7 @@
         endif
     endif
     if (log_interp) matpower = log(sign*matpower)
-    call spline_def(kvals,matpower,MTrans%num_q_trans, ddmat)
+    call cubic_spline_second_derivs(kvals,matpower,MTrans%num_q_trans, ddmat)
 
     llo=1
     lastix = npoints + 1
@@ -3730,8 +3951,11 @@
     Type(MatterTransferData) :: MTrans
     real(dl), intent(in), optional :: R
     integer, intent(in), optional :: var_delta, var_v
-    real(dl) :: radius
-    integer :: s1, s2
+    real(dl) :: radius, kh, k, h, x, win, lnk, dlnk, lnko, powers
+    real(dl), dimension(State%CP%Transfer%PK_num_redshifts) :: delta, dsig8, dsig8o, sig8, dsigv, dsigvo, sigv
+    integer, dimension(State%CP%Transfer%PK_num_redshifts) :: redshifts_index
+    integer :: s1, s2, ik, nred
+    logical :: do_growth
 
     if (global_error_flag /= 0) return
 
@@ -3739,9 +3963,54 @@
     s1 = PresentDefault (transfer_power_var, var_delta)
     s2 = PresentDefault (Transfer_Newt_vel_cdm, var_v)
 
-    call Transfer_Get_SigmaR(State, MTrans, radius, MTrans%sigma_8, s1,s1)
-    if (State%get_growth_sigma8) call Transfer_Get_SigmaR(State, MTrans, radius, &
-        MTrans%sigma2_vdelta_8(:), s1, s2, root=.false.)
+    nred = State%CP%Transfer%PK_num_redshifts
+    h=State%CP%h0/100._dl
+    lnko=0
+    dsig8o=0
+    sig8=0
+    dsigvo=0
+    sigv=0
+    redshifts_index = State%PK_redshifts_index(1:nred)
+    do_growth = State%get_growth_sigma8
+
+    do ik=1, MTrans%num_q_trans
+        kh = MTrans%TransferData(Transfer_kh,ik,1)
+        if (kh==0) cycle
+        k = kh*h
+
+        delta = MTrans%TransferData(s1,ik,redshifts_index)
+        dsig8 = delta**2
+        if (do_growth) dsigv = delta*MTrans%TransferData(s2,ik,redshifts_index)
+
+        x= kh*radius
+        if (x < 1e-2_dl) then
+            win = 1._dl - x**2/10
+        else
+            win = 3*(sin(x)-x*cos(x))/x**3
+        end if
+        lnk=log(k)
+        if (ik==1) then
+            dlnk=0.5_dl
+            !Approx for 2._dl/(Params%InitPower%an(in)+3)  [From int_0^k_1 dk/k k^4 P(k)]
+            !Contribution should be very small in any case
+        else
+            dlnk=lnk-lnko
+        end if
+        powers = (win*k**2)**2*State%CP%InitPower%ScalarPower(k)
+
+        dsig8=powers*dsig8
+        sig8=sig8+(dsig8+dsig8o)*dlnk/2
+        dsig8o=dsig8
+        if (do_growth) then
+            dsigv=powers*dsigv
+            sigv=sigv+(dsigv+dsigvo)*dlnk/2
+            dsigvo=dsigv
+        end if
+        lnko=lnk
+    end do
+
+    MTrans%sigma_8(1:nred) = sqrt(sig8)
+    if (do_growth) MTrans%sigma2_vdelta_8(1:nred) = sigv
 
     end subroutine Transfer_Get_sigmas
 

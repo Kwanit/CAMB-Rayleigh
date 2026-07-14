@@ -4,6 +4,10 @@
     !lensing_method=2: using the flat-sky lower order result of astro-ph/9505109
     !                  and astro-ph/9803150 as in CMBFAST
     !lensing_method=3: using inaccurate full sky harmonic method of astro-ph/0001303
+    !lensing_method=4: using full Gauss-Legendre curved-sky integration following
+    !                  the structure of camb.correlations.lensed_cls
+    !lensing_method=5: optimized May 2026 default; use method 1 when AccurateBB=F
+    !                  and method 4 when AccurateBB=T
 
     !The flat sky result is accurate to about 0.1% in TT, and 0.4% in EE and is
     !about a factor of two faster than lensing_method=1.
@@ -34,17 +38,20 @@
     !obtainable from the CPC program library (www.cpc.cs.qub.ac.uk).
 
     !March 2006: fixed problem with l_max when generating with tensors (thanks Chad Fendt)
+    !May 2026: added full curved-sky method 4 and optimized selector method 5;
+    !method 5 is now the default lensing method.
 
     module lensing
     use Precision
     use results
     use constants, only : const_pi, const_twopi, const_fourpi
-    use splines
+    use MathUtils, only : Gauss_Legendre
+    !$ use omp_lib, only: omp_get_thread_num, omp_get_max_threads
     implicit none
     integer, parameter :: lensing_method_curv_corr=1,lensing_method_flat_corr=2, &
-        lensing_method_harmonic=3
+        lensing_method_harmonic=3, lensing_method_curv_corr_full=4, lensing_method_optimized=5
 
-    integer :: lensing_method = lensing_method_curv_corr
+    integer :: lensing_method = lensing_method_optimized
 
     real(dl) :: lensing_sanity_check_amplitude = 1e-7_dl
 
@@ -54,6 +61,9 @@
     private
 
     logical  :: lensing_includes_tensors = .false.
+    real(dl), parameter :: low_l_ee_lensing_taper_lmin = 2._dl
+    real(dl), parameter :: low_l_ee_lensing_taper_lmax = 20._dl
+    integer, parameter :: default_lensing_extrap_lmax_margin = 750
 
     !flat method stores
     real(dl), parameter :: dbessel = 0.05_dl
@@ -64,42 +74,67 @@
     integer :: lmax_donelnfa = 0
     real(dl), dimension(:), allocatable  :: lnfa
 
+    integer :: gauss_legendre_cache_npoints = 0
+    real(dl), dimension(:), allocatable, target :: gauss_legendre_cache_xvals, gauss_legendre_cache_weights
+
     public lens_Cls, lensing_includes_tensors, lensing_method, lensing_method_flat_corr,&
-        lensing_method_curv_corr,lensing_method_harmonic, BessI, ALens_Fiducial, &
-        lensing_sanity_check_amplitude, lensClsWithSpectrum, &
+        lensing_method_curv_corr,lensing_method_harmonic, lensing_method_curv_corr_full, lensing_method_optimized, &
+        ALens_Fiducial, lensing_sanity_check_amplitude, lensClsWithSpectrum, &
         GetFlatSkyCGrads, GetFlatSkyCgradsWithSpectrum
     contains
 
 
+    pure function LowLEELensingTaper(l) result(taper)
+    integer, intent(in) :: l
+    real(dl) :: taper, x
+
+    x = (real(l, dl) - low_l_ee_lensing_taper_lmin) / &
+        (low_l_ee_lensing_taper_lmax - low_l_ee_lensing_taper_lmin)
+    taper = max(0._dl, min(1._dl, x))
+    taper = taper**2*(3._dl - 2._dl*taper)
+    end function LowLEELensingTaper
+
+
+    integer function effective_lensing_method(CP) result(method)
+    use model, only : CAMBparams
+    type(CAMBparams), intent(in) :: CP
+
+    method = lensing_method
+    if (method == lensing_method_optimized) then
+        if (CP%Accuracy%AccurateBB) then
+            method = lensing_method_curv_corr_full
+        else
+            method = lensing_method_curv_corr
+        end if
+    end if
+    end function effective_lensing_method
+
+
     subroutine lens_Cls(State)
     class(CAMBdata) :: State
+    integer :: method
 
-    if (lensing_method == lensing_method_curv_corr) then
-        call CorrFuncFullSky(State)
-    elseif (lensing_method == lensing_method_flat_corr) then
+    method = effective_lensing_method(State%CP)
+
+    if (method == lensing_method_curv_corr .or. method == lensing_method_curv_corr_full) then
+        call LensClsWithDefaultSpectrum(State, method == lensing_method_curv_corr_full)
+    elseif (method == lensing_method_flat_corr) then
         call CorrFuncFlatSky(State)
-    elseif (lensing_method == lensing_method_harmonic) then
+    elseif (method == lensing_method_harmonic) then
         call BadHarmonic(State)
     else
         error stop 'Unknown lensing method'
     end if
     end subroutine lens_Cls
 
-    subroutine CorrFuncFullSky(State)
+    subroutine LensClsWithDefaultSpectrum(State, full_range)
     class(CAMBdata) :: State
-    integer :: lmax_extrap,l
+    logical, intent(in) :: full_range
     real(dl) CPP(0:State%CP%max_l)
 
-    lmax_extrap = State%CP%Max_l - lensed_convolution_margin + 750
-    lmax_extrap = min(lmax_extrap_highl,lmax_extrap)
-    do l= State%CP%min_l,State%CP%max_l
-        ! Cl_scalar(l,1,C_Phi) is l^4 C_phi_phi
-        CPP(l) = State%CLdata%Cl_scalar(l,C_Phi)*(l+1)**2/real(l,dl)**2/const_twopi
-    end do
-    call CorrFuncFullSkyImpl(State, State%ClData, State%ClData, CPP, &
-        State%CP%min_l,max(lmax_extrap,State%CP%max_l))
-
-    end subroutine CorrFuncFullSky
+    call SetLensingPotentialSpectrum(State, CPP)
+    call CorrFuncFullSkyWithSpectrum(State, State%ClData, CPP, full_range)
+    end subroutine LensClsWithDefaultSpectrum
 
     subroutine lensClsWithSpectrum(State, CPP, lensedCls, lmax_lensed)
     !Get lensed CL using CPP as the lensing specturm
@@ -109,12 +144,10 @@
     real(dl) :: lensedCls(4, 0:State%CP%Max_l)
     integer :: lmax_lensed
     Type(TCLData) :: CLout
-    integer :: lmax_extrap, l
+    integer :: l, method
 
-    lmax_extrap = State%CP%Max_l - lensed_convolution_margin + 750
-    lmax_extrap = min(lmax_extrap_highl,lmax_extrap)
-    call CorrFuncFullSkyImpl(State, State%ClData, CLout, CPP, &
-        State%CP%min_l,max(lmax_extrap,State%CP%max_l))
+    method = effective_lensing_method(State%CP)
+    call CorrFuncFullSkyWithSpectrum(State, CLout, CPP, method == lensing_method_curv_corr_full)
     lmax_lensed = CLout%lmax_lensed
 
     do l=State%CP%min_l, lmax_lensed
@@ -123,6 +156,47 @@
 
     end subroutine lensClsWithSpectrum
 
+    integer function LensingExtrapLmax(State) result(lmax)
+    class(CAMBdata), intent(in) :: State
+    integer :: extrap_margin, output_lmax
+    real(dl) :: LensAccuracyBoost
+
+    output_lmax = State%CP%Max_l - State%CP%lens_output_margin
+    LensAccuracyBoost = State%CP%Accuracy%AccuracyBoost * State%CP%Accuracy%LensingBoost
+    extrap_margin = default_lensing_extrap_lmax_margin
+    if (AccuracyTarget > 0) then
+        extrap_margin = max(extrap_margin, ceiling((0.45_dl * output_lmax + 400._dl) * LensAccuracyBoost))
+    end if
+
+    lmax = output_lmax + lens_convolution_gap + extrap_margin
+    lmax = min(lmax_extrap_highl, lmax)
+    lmax = max(lmax, State%CP%Max_l)
+    end function LensingExtrapLmax
+
+    subroutine SetLensingPotentialSpectrum(State, CPP)
+    class(CAMBdata), intent(in) :: State
+    real(dl), intent(out) :: CPP(0:State%CP%max_l)
+    integer :: l
+
+    do l=State%CP%min_l, State%CP%max_l
+        ! Cl_scalar(l,1,C_Phi) is l^4 C_phi_phi.
+        CPP(l) = State%CLdata%Cl_scalar(l,C_Phi)*(l+1)**2/real(l,dl)**2/const_twopi
+    end do
+    end subroutine SetLensingPotentialSpectrum
+
+    subroutine CorrFuncFullSkyWithSpectrum(State, CLout, CPP, full_range)
+    class(CAMBdata), target :: State
+    Type(TCLData) :: CLout
+    real(dl), intent(in) :: CPP(0:State%CP%max_l)
+    logical, intent(in) :: full_range
+
+    if (full_range) then
+        call CorrFuncFullSky(State, State%ClData, CLout, CPP, State%CP%min_l, LensingExtrapLmax(State))
+    else
+        call CorrFuncFullSkyApodized(State, State%ClData, CLout, CPP, State%CP%min_l, LensingExtrapLmax(State))
+    end if
+    end subroutine CorrFuncFullSkyWithSpectrum
+
     subroutine AmplitudeError
 
     call GlobalError('You need to normalize realistically to use lensing. ' &
@@ -130,7 +204,100 @@
 
     end subroutine AmplitudeError
 
-    subroutine CorrFuncFullSkyImpl(State,CL,CLout,CPP,lmin,lmax)
+    subroutine GetCachedGaussLegendre(npoints, xvals, weights)
+    !Note the module-level cache means this is not safe for concurrent use from
+    !different threads/States (the returned pointers are invalidated by a call
+    !with a different npoints)
+    integer, intent(in) :: npoints
+    real(dl), pointer :: xvals(:), weights(:)
+
+    if (.not. allocated(gauss_legendre_cache_xvals) .or. gauss_legendre_cache_npoints /= npoints) then
+        if (allocated(gauss_legendre_cache_xvals)) deallocate(gauss_legendre_cache_xvals, gauss_legendre_cache_weights)
+        allocate(gauss_legendre_cache_xvals(npoints), gauss_legendre_cache_weights(npoints))
+        call Gauss_Legendre(gauss_legendre_cache_xvals, gauss_legendre_cache_weights, npoints)
+        gauss_legendre_cache_npoints = npoints
+    end if
+    xvals => gauss_legendre_cache_xvals
+    weights => gauss_legendre_cache_weights
+    end subroutine GetCachedGaussLegendre
+
+    subroutine InitLensedClArrays(State, CLout, lmin)
+    !Set CLout%lmax_lensed from the l sampling and allocate the lensed output array
+    class(CAMBdata), target :: State
+    Type(TCLData) :: CLout
+    integer, intent(in) :: lmin
+    integer :: max_lensed_ix
+
+    associate(lSamp => State%CLData%CTransScal%ls, CP=>State%CP)
+        max_lensed_ix = lSamp%nl-1
+        do while(lSamp%l(max_lensed_ix) > CP%Max_l - (CP%lens_output_margin - lens_convolution_gap))
+            max_lensed_ix = max_lensed_ix -1
+        end do
+        CLout%lmax_lensed = max(lSamp%l(max_lensed_ix), CP%Max_l - CP%lens_output_margin)
+    end associate
+    if (allocated(CLout%Cl_lensed)) deallocate(CLout%Cl_lensed)
+    allocate(CLout%Cl_lensed(lmin:CLout%lmax_lensed,1:4), source = 0._dl)
+    end subroutine InitLensedClArrays
+
+    subroutine PrepareLensedCLSpectra(State, CL, lmin, lmax, ee_taper, CPP, Cphil3, CTT, CEE, CTE)
+    !Weighted unlensed spectra and lensing potential entering the correlation function
+    !integrands, extended above CP%Max_l using the (rescaled) high-L template.
+    !Sets global error (via AmplitudeError) if the lensing spectrum is unrealistically large.
+    class(CAMBdata), target :: State
+    Type(TCLData), intent(in) :: CL
+    integer, intent(in) :: lmin, lmax
+    logical, intent(in) :: ee_taper
+    real(dl), intent(in) :: CPP(0:State%CP%max_l) ! [L(L+1)]^2 C_L_phi_phi/2pi
+    real(dl), intent(out) :: Cphil3(lmin:lmax), CTT(lmin:lmax), CEE(lmin:lmax), CTE(lmin:lmax)
+    integer :: l
+    real(dl) :: sc, fac, fac2, fac3, tail_te_fac
+
+    associate(CP=>State%CP)
+        do l=lmin,CP%Max_l
+            ! (2*l+1)l(l+1)/4pi C_phi_phi
+            Cphil3(l) = CPP(l)*(l+0.5_dl)/real((l+1)*l, dl)
+            fac = (2*l+1)/const_fourpi * const_twopi/(l*(l+1))
+            CTT(l) =  CL%Cl_scalar(l,C_Temp)*fac
+            CEE(l) =  CL%Cl_scalar(l,C_E)*fac
+            ! In the short-range convolution, reionization-bump EE has negligible
+            ! impact but makes the lowest-L polarization correction window-sensitive.
+            if (ee_taper) CEE(l) = CEE(l)*LowLEELensingTaper(l)
+            CTE(l) =  CL%Cl_scalar(l,C_Cross)*fac
+        end do
+        if (CP%Max_l >= 10 .and. Cphil3(10) > lensing_sanity_check_amplitude) then
+            call AmplitudeError()
+            return
+        end if
+        if (lmax > CP%Max_l) then
+            l=CP%Max_l
+            sc = (2*l+1)/const_fourpi * const_twopi/(l*(l+1))
+            fac2 = CTT(CP%Max_l)/(sc*highL_CL_template(CP%Max_l, C_Temp))
+            fac3 = CEE(CP%Max_l)/(sc*highL_CL_template(CP%Max_l, C_E))
+            tail_te_fac = sqrt(max(0._dl, fac2*fac3))
+            fac = Cphil3(CP%Max_l)/(sc*highL_CL_template(CP%Max_l, C_Phi))
+            do l=CP%Max_l+1, lmax
+                !Fill in tail from template
+                sc = (2*l+1)/const_fourpi * const_twopi/(l*(l+1))
+                Cphil3(l) = highL_CL_template(l, C_Phi)*fac*sc
+
+                CTT(l) =  highL_CL_template(l, C_Temp)*fac2*sc
+                CEE(l) =  highL_CL_template(l, C_E)*fac3*sc
+                CTE(l) =  highL_CL_template(l, C_Cross)*tail_te_fac*sc
+            end do
+            if (Cphil3(CP%Max_l+1) > 1e-7_dl) then
+                call MpiStop('You need to normalize the high-L template so it is dimensionless')
+            end if
+        end if
+        if (ALens_Fiducial > 0) then
+            do l=2, lmax
+                sc = (2*l+1)/const_fourpi * const_twopi/(l*(l+1))
+                Cphil3(l) =  sc * highL_CL_template(l, C_Phi) * ALens_Fiducial
+            end do
+        end if
+    end associate
+    end subroutine PrepareLensedCLSpectra
+
+    subroutine CorrFuncFullSkyApodized(State,CL,CLout,CPP,lmin,lmax)
     !Accurate curved sky correlation function method
     !Uses non-perturbative isotropic term with 2nd order expansion in C_{gl,2}
     !Neglects C_{gl}(theta) terms (very good approx)
@@ -146,13 +313,10 @@
     real(dl) P(lmax),dP(lmax)
     real(dl) sinth,halfsinth, x, T2,T4
     real(dl) roots(-1:lmax+4), lfacs(lmax), lfacs2(lmax), lrootfacs(lmax)
-    integer max_lensed_ix
     real(dl) d_11(lmax),d_m11(lmax)
     real(dl) d_22(lmax),d_2m2(lmax),d_20(lmax)
-    real(dl) Cphil3(lmin:lmax), CTT(lmin:lmax), CTE(lmin:lmax),CEE(lmin:lmax)
-    real(dl) ls(lmax)
-    real(dl) xl(lmax)
-    real(dl), allocatable :: ddcontribs(:,:),corrcontribs(:,:)
+    real(dl) Cphil3(lmin:lmax), CTT(lmin:lmax), CTE(lmin:lmax), CEE(lmin:lmax)
+    integer ls(lmax)
     real(dl), allocatable :: lens_contrib(:,:,:)
     integer thread_ix
     real(dl) pmm, pmmp1
@@ -162,40 +326,40 @@
     real(dl) dX000,dX022
     integer  interp_fac
     integer j,jmax
-    integer llo, lhi
-    real(dl) a0,b0,ho, sc
+    real(dl) sc, taper
     integer apodize_point_width
     logical :: short_integral_range
-    real(dl) range_fac
+    real(dl) range_fac, apodize_width
     logical, parameter :: approx = .false.
-    real(dl) theta_cut(lmax), LensAccuracyBoost
+    real(dl) theta_cut(lmax), LensAccuracyBoost, ThetaSampleBoost, LensRangeBoost
+    real(dl) high_l_lensed_lmax, high_l_ramp
     Type(TTimer) :: Timer
 
-    !$ integer  OMP_GET_THREAD_NUM, OMP_GET_MAX_THREADS
-    !$ external OMP_GET_THREAD_NUM, OMP_GET_MAX_THREADS
-
     if (lensing_includes_tensors) call MpiStop('Haven''t implemented tensor lensing')
-    associate(lSamp => State%CLData%CTransScal%ls, CP=>State%CP)
+    associate(CP=>State%CP)
 
+        high_l_lensed_lmax = real(CP%Max_l - CP%lens_output_margin, dl)
+        high_l_ramp = min(1._dl, max(0._dl, (high_l_lensed_lmax - 2500._dl)/1000._dl))
+        high_l_ramp = high_l_ramp**2*(3._dl - 2._dl*high_l_ramp)
         LensAccuracyBoost = CP%Accuracy%AccuracyBoost*CP%Accuracy%LensingBoost
-        max_lensed_ix = lSamp%nl-1
-        do while(lSamp%l(max_lensed_ix) > CP%Max_l - lensed_convolution_margin)
-            max_lensed_ix = max_lensed_ix -1
-        end do
-        !150 is the default margin added in python by set_for_lmax
-        CLout%lmax_lensed = max(lSamp%l(max_lensed_ix), CP%Max_l - 150)
+        LensRangeBoost = LensAccuracyBoost
+        ThetaSampleBoost = LensAccuracyBoost
 
-        if (allocated(CLout%Cl_lensed)) deallocate(CLout%Cl_lensed)
-        allocate(CLout%Cl_lensed(lmin:CLout%lmax_lensed,1:4), source = 0._dl)
+        if (AccuracyTarget > 0) then
+            ThetaSampleBoost = ThetaSampleBoost * (1.6_dl + 0.6_dl*high_l_ramp)
+        else if (CP%Max_l > 3500) then
+            ThetaSampleBoost = ThetaSampleBoost * 1.3_dl
+        end if
+        call InitLensedClArrays(State, CLout, lmin)
 
-        npoints = CP%Max_l  * 2 *LensAccuracyBoost
+        npoints = CP%Max_l  * 2 * ThetaSampleBoost
         short_integral_range = .not. CP%Accuracy%AccurateBB
         dtheta = const_pi / npoints
-        if (CP%Max_l > 3500) dtheta=dtheta/1.3
-        apodize_point_width = nint(0.003 / dtheta)
+        apodize_width = 0.012_dl
+        apodize_point_width = nint(apodize_width / dtheta)
         npoints = int(const_pi/dtheta)
         if (short_integral_range) then
-            range_fac= max(1._dl,32/LensAccuracyBoost) !fraction of range to integrate
+            range_fac= max(1._dl,32/LensRangeBoost) !fraction of range to integrate
             npoints = int(npoints /range_fac)
             !OK for TT, EE, TE but inaccurate for low l BB
             !this induces high frequency ringing on very small scales
@@ -206,20 +370,21 @@
 
         if (DebugMsgs) call Timer%Start()
 
-        interp_fac = max(1,min(nint(10/LensAccuracyBoost),int(range_fac*2)-1))
+        interp_fac = max(1,min(nint(10/LensRangeBoost),int(range_fac*2)-1))
 
         jmax = 0
         do l=lmin,lmax
             if (l<=15 .or. mod(l-15,interp_fac)==interp_fac/2) then
                 jmax =jmax+1
                 ls(jmax)=l
-                xl(jmax)=l
             end if
             lfacs(l) = real(l*(l+1),dl)
             lfacs2(l) = real((l+2)*(l-1),dl)
             lrootfacs(l) = sqrt(lfacs(l)*lfacs2(l))
         end do
         do l=2,lmax
+            ! Equivalent to the Python correlations.py indser threshold, but written
+            ! as a per-l cutoff in theta rather than a per-x split in l.
             theta_cut(l) = 0.244949_dl/sqrt(3._dl*lfacs(l) - 8._dl)
         end do
 
@@ -231,51 +396,19 @@
         thread_ix = 1
         !$ thread_ix = OMP_GET_MAX_THREADS()
         allocate(lens_contrib(4,CLout%lmax_lensed,thread_ix))
-        allocate(ddcontribs(lmax,4),corrcontribs(lmax,4))
 
-        do l=lmin,CP%Max_l
-            ! (2*l+1)l(l+1)/4pi C_phi_phi: Cl_scalar(l,1,C_Phi) is l^4 C_phi_phi
-            Cphil3(l) = CPP(l)*(l+0.5_dl)/real((l+1)*l, dl)
-            fac = (2*l+1)/const_fourpi * const_twopi/(l*(l+1))
-            CTT(l) =  CL%Cl_scalar(l,C_Temp)*fac
-            CEE(l) =  CL%Cl_scalar(l,C_E)*fac
-            CTE(l) =  CL%Cl_scalar(l,C_Cross)*fac
-        end do
-        if (Cphil3(10) > lensing_sanity_check_amplitude) then
-            call AmplitudeError()
-            return
-        end if
-        if (lmax > CP%Max_l) then
-            l=CP%Max_l
-            sc = (2*l+1)/const_fourpi * const_twopi/(l*(l+1))
-            fac2=CTT(CP%Max_l)/(sc*highL_CL_template(CP%Max_l, C_Temp))
-            fac=Cphil3(CP%Max_l)/(sc*highL_CL_template(CP%Max_l, C_Phi))
-            do l=CP%Max_l+1, lmax
-                !Fill in tail from template
-                sc = (2*l+1)/const_fourpi * const_twopi/(l*(l+1))
-                Cphil3(l) = highL_CL_template(l, C_Phi)*fac*sc
-
-                CTT(l) =  highL_CL_template(l, C_Temp)*fac2*sc
-                CEE(l) =  highL_CL_template(l, C_E)*fac2 *sc
-                CTE(l) =  highL_CL_template(l, C_Cross)*fac2*sc
-                if (Cphil3(CP%Max_l+1) > 1e-7) then
-                    call MpiStop('You need to normalize the high-L template so it is dimensionless')
-                end if
-            end do
-        end if
-        if (ALens_Fiducial > 0) then
-            do l=2, lmax
-                sc = (2*l+1)/const_fourpi * const_twopi/(l*(l+1))
-                Cphil3(l) =  sc * highL_CL_template(l, C_Phi) * ALens_Fiducial
-            end do
-        end if
+        call PrepareLensedCLSpectra(State, CL, lmin, lmax, .true., CPP, Cphil3, CTT, CEE, CTE)
+        if (global_error_flag /= 0) return
 
         lens_contrib=0
 
-        !$OMP PARALLEL DO DEFAULT(PRIVATE),  &
+        !$OMP PARALLEL DEFAULT(PRIVATE),  &
         !$OMP SHARED(lfacs,lfacs2,lrootfacs,Cphil3,CTT,CTE,CEE,lens_contrib,theta_cut), &
         !$OMP SHARED(lmin, lmax,dtheta,CL,CLout,roots, npoints,interp_fac), &
-        !$OMP SHARED(jmax,ls,xl,short_integral_range,apodize_point_width)
+        !$OMP SHARED(jmax,ls,short_integral_range,apodize_point_width)
+        thread_ix = 1
+        !$ thread_ix = OMP_GET_THREAD_NUM()+1
+        !$OMP DO
         do i=1,npoints-1
 
             theta = i * dtheta
@@ -332,6 +465,7 @@
 
             end do
 
+            corr = 0._dl
             do j=1,jmax
                 l =ls(j)
 
@@ -423,75 +557,41 @@
                 fac = ( (X000**2-1) + Cg2sq*fac1)*P(l)+ Cg2sq*fac3*d2m2 &
                     + 8/llp1* fac1*Cg2*dm11
 
-                corrcontribs(j,1)=  CTT(l) * fac
+                if (j > 14) then
+                    sc = real(interp_fac, dl)
+                else
+                    sc = 1._dl
+                end if
+                corr(1) = corr(1) + sc*CTT(l)*fac
 
                 fac2=(Cg2*dX022)**2+(X022**2-1)
                 !Q+U
                 fac = 2*Cg2*X121*X132*d13 + fac2*d22 +Cg2sq*X242*X220*d04
 
-                corrcontribs(j,2)= CEE(l) * fac
+                corr(2) = corr(2) + sc*CEE(l)*fac
 
                 !Q-U
                 fac = ( fac3*P(l) + X242**2*d4m4)*Cg2sq/2 &
                     + Cg2*(X121**2*dm11+ X132**2*d3m3) + fac2*d2m2
 
-                corrcontribs(j,3)= CEE(l) * fac
+                corr(3) = corr(3) + sc*CEE(l)*fac
 
                 !TE
                 fac = (X000*X022-1)*d20+ &
                     2*dX000*Cg2*(X121*d11 + X132*d1m3)/rootllp1 &
                     + Cg2sq*(X220/2*d2m4*X242 +( fac3/2 + dX022*dX000)*d20)
 
-                corrcontribs(j,4)= CTE(l) * fac
+                corr(4) = corr(4) + sc*CTE(l)*fac
 
             end do
 
-            do j=1,4
-                corr(j) = sum(corrcontribs(1:14,j))+interp_fac*sum(corrcontribs(15:jmax,j))
-            end do
-
-            !if (short_integral_range .and. i>npoints-20) &
-            !        corr=corr*exp(-(i-npoints+20)**2/150.0) !taper the end to help prevent ringing
-
-            if (short_integral_range .and. i>npoints-apodize_point_width*3) &
-                corr=corr*exp(-(i-npoints+apodize_point_width*3)**2/real(2*apodize_point_width**2))
-            !taper the end to help prevent ringing
-
-
-            !Interpolate contributions
-            !Increasing interp_fac and using this seems to be slower than above
-            if (.false.) then
-                if (abs(sum(corrcontribs(1:jmax,1)))>1e-11) print *,i,sum(corrcontribs(1:jmax,1))
-                do j=1,4
-                    call spline_def(xl,corrcontribs(:,j),jmax,ddcontribs(:,j))
-                end do
-                corr=0
-                llo=1
-                do l=lmin,lmax
-                    if ((l > ls(llo+1)).and.(llo < jmax)) then
-                        llo=llo+1
-                    end if
-                    lhi=llo+1
-                    ho=ls(lhi)-ls(llo)
-                    a0=(ls(lhi)-l)/ho
-                    b0=(l-ls(llo))/ho
-                    fac1 = ho**2/6
-                    fac2 = (b0**3-b0)*fac1
-                    fac1 = (a0**3-a0)*fac1
-
-                    corr(1) = Corr(1)+ a0*corrcontribs(llo,1)+ b0*corrcontribs(lhi,1)+ &
-                        fac1* ddcontribs(llo,1) +fac2*ddcontribs(lhi,1)
-                    corr(2) = Corr(2)+ a0*corrcontribs(llo,2)+ b0*corrcontribs(lhi,2)+ &
-                        fac1* ddcontribs(llo,2) +fac2*ddcontribs(lhi,2)
-                    corr(3) = Corr(3)+ a0*corrcontribs(llo,3)+ b0*corrcontribs(lhi,3)+ &
-                        fac1* ddcontribs(llo,3) +fac2*ddcontribs(lhi,3)
-                    corr(4) = Corr(4)+ a0*corrcontribs(llo,4)+ b0*corrcontribs(lhi,4)+ &
-                        fac1* ddcontribs(llo,4) +fac2*ddcontribs(lhi,4)
-
-                end do
+            if (short_integral_range .and. i>npoints-apodize_point_width) then
+                !taper the end to help prevent ringing
+                taper = real(npoints-i, dl)/real(apodize_point_width, dl)
+                taper = max(0._dl, min(1._dl, taper))
+                taper = taper**3*(10._dl + taper*(-15._dl + 6._dl*taper))
+                corr = corr*taper
             end if
-
-            !$  thread_ix = OMP_GET_THREAD_NUM()+1
 
             do l=lmin, CLout%lmax_lensed
                 !theta factors were put in earlier (already in corr)
@@ -501,7 +601,6 @@
 
                 T2 = corr(2)* d_22(l)
                 T4 = corr(3)* d_2m2(l)
-
 
                 lens_contrib(CT_E, l, thread_ix)= lens_contrib(CT_E,l, thread_ix) + &
                     (T2+T4)*halfsinth
@@ -514,25 +613,284 @@
             end do
 
         end do
-        !$OMP END PARALLEL DO
+        !$OMP END DO
+        !$OMP END PARALLEL
 
         do l=lmin, CLout%lmax_lensed
+            corr = 0._dl
+            do thread_ix = 1, size(lens_contrib, 3)
+                corr = corr + lens_contrib(:, l, thread_ix)
+            end do
             !sign from d(cos theta) = -sin theta dtheta
             fac = l*(l+1)/OutputDenominator*dtheta*const_twopi
-            CLout%Cl_lensed(l,CT_Temp) = sum(lens_contrib(CT_Temp,l,:))*fac &
-                + CL%Cl_scalar(l,C_Temp)
-            CLout%Cl_lensed(l,CT_E) = sum(lens_contrib(CT_E,l,:))*fac &
-                + CL%Cl_scalar(l,C_E)
-            CLout%Cl_lensed(l,CT_B) = sum(lens_contrib(CT_B,l,:))*fac
-            CLout%Cl_lensed(l,CT_Cross) = sum(lens_contrib(CT_Cross,l,:))*fac &
-                + CL%Cl_scalar(l,C_Cross)
+            CLout%Cl_lensed(l,CT_Temp) = corr(CT_Temp)*fac + CL%Cl_scalar(l,C_Temp)
+            CLout%Cl_lensed(l,CT_E) = corr(CT_E)*fac + CL%Cl_scalar(l,C_E)
+            CLout%Cl_lensed(l,CT_B) = corr(CT_B)*fac
+            CLout%Cl_lensed(l,CT_Cross) = corr(CT_Cross)*fac + CL%Cl_scalar(l,C_Cross)
 
         end do
 
         if (DebugMsgs) call Timer%WriteTime('Time for corr lensing')
     end associate
 
-    end subroutine CorrFuncFullSkyImpl
+    end subroutine CorrFuncFullSkyApodized
+
+    subroutine CorrFuncFullSky(State,CL,CLout,CPP,lmin,lmax)
+    !Full Gauss-Legendre implementation matching camb.correlations.lensed_cls,
+    !with the same high-L template extension used by the standard Fortran code.
+    !Uses the non-perturbative isotropic term with 2nd order expansion in C_{gl,2},
+    !with no interpolation or sub-sampling in theta or l (unlike CorrFuncFullSkyApodized).
+    class(CAMBdata), target :: State
+    Type(TCLData) :: CL, CLout
+    real(dl) :: CPP(0:State%CP%max_l) ! [L(L+1)]^2 C_L_phi_phi/2pi
+    integer, intent(in) :: lmin,lmax
+    integer :: l, i, npoints, imin, thread_ix
+    real(dl) :: LensAccuracyBoost, sampling_factor, range_fac, theta_max, xmin, xtaper_start
+    real(dl) :: fac, weight, theta, taper, apodize_theta_width
+    real(dl) :: contrib_sum(4)
+    real(dl), pointer :: xvals(:), weights(:)
+    !x-independent l factors shared by all integration points
+    real(dl) :: lfacs(lmax), lfacs2(lmax), invlfacs(lmax), invlfacs2(lmax), invlrootfacs(lmax)
+    real(dl) :: rootfac1(lmax), invrootfac1(lmax), rootfac2(lmax), invrootfac2(lmax)
+    real(dl) :: invrootfac3(lmax), rootrat(lmax), invlfacsm12(lmax), theta_cut(lmax)
+    real(dl) :: Cphil3(lmin:lmax), CTT(lmin:lmax), CTE(lmin:lmax), CEE(lmin:lmax)
+    !per-point work arrays, private to each OpenMP thread
+    real(dl) :: P(lmax), dP(lmax), d11(lmax), dm11(lmax), d20(lmax), d22(lmax), d2m2(lmax)
+    real(dl) :: x, sin2, rsin2, sinth, sinfac, fac1, fac2, ffac, rfac
+    real(dl) :: tfac1, tfac2, d2m4fac, d4m4fac, c22fac, c2m2fac
+    real(dl) :: sigma2, Cg2, pmm, pmmp1, expsig, expl, facexp, c2fac, c2fac2, fEE, fTE
+    real(dl) :: d1m2, d12, d1m3, d2m3, d3m3, d13, d04, d2m4, d4m4
+    real(dl) :: corr(4), wcorr1, wcorr2, wcorr3, wcorr4, T2, T4
+    real(dl), allocatable :: lens_contrib(:,:,:)
+    Type(TTimer) :: Timer
+
+    if (lensing_includes_tensors) call MpiStop('Haven''t implemented tensor lensing')
+    associate(CP=>State%CP)
+
+        LensAccuracyBoost = CP%Accuracy%AccuracyBoost*CP%Accuracy%LensingBoost
+        call InitLensedClArrays(State, CLout, lmin)
+
+        sampling_factor = 1.4_dl*LensAccuracyBoost
+        npoints = int(sampling_factor*lmax) + 1
+        call GetCachedGaussLegendre(npoints, xvals, weights)
+
+        if (.not. CP%Accuracy%AccurateBB) then
+            range_fac = max(1._dl,32._dl/LensAccuracyBoost)
+            theta_max = const_pi/range_fac
+            xmin = cos(theta_max)
+            imin = 1
+            do while (imin <= npoints .and. xvals(imin) < xmin)
+                imin = imin + 1
+            end do
+            ! C2 taper over a fixed angular width. This damps short-range ringing
+            ! without tying the window shape to the local Gauss-Legendre point spacing.
+            apodize_theta_width = min(theta_max,48._dl*const_pi/lmax)
+            xtaper_start = cos(theta_max - apodize_theta_width)
+        else
+            imin = 1
+            apodize_theta_width = 0._dl
+            xtaper_start = -1._dl
+        end if
+
+        lfacs(1) = 2._dl
+        invlfacs(1) = 0.5_dl
+        do l=2,lmax
+            lfacs(l) = real(l*(l+1),dl)
+            lfacs2(l) = real((l+2)*(l-1),dl)
+            invlfacs(l) = 1._dl/lfacs(l)
+            invlfacs2(l) = 1._dl/lfacs2(l)
+            invlrootfacs(l) = 1._dl/sqrt(lfacs(l)*lfacs2(l))
+            rootfac1(l) = sqrt(lfacs2(l))
+            invrootfac1(l) = 1._dl/rootfac1(l)
+            ! Same stability switch as correlations.py, expressed as a per-l cutoff in theta.
+            theta_cut(l) = 0.244949_dl/sqrt(3._dl*lfacs(l) - 8._dl)
+        end do
+        do l=3,lmax
+            rootfac2(l) = sqrt(real((l+3)*(l-2),dl))
+            invrootfac2(l) = 1._dl/rootfac2(l)
+            rootrat(l) = rootfac1(l)*invrootfac2(l)
+        end do
+        do l=4,lmax
+            invrootfac3(l) = 1._dl/sqrt(real((l-3)*(l+4),dl))
+            invlfacsm12(l) = 1._dl/(lfacs(l) - 12._dl)
+        end do
+
+        !Taper the reionization-bump EE out of the kernel in the truncated mode: its
+        !low-L lensed BB contribution is otherwise window-sensitive (does not converge
+        !with the integration range for high tau). The full-range AccurateBB=T mode
+        !keeps it. Matches python lensed_cls with low_l_ee_taper=True.
+        call PrepareLensedCLSpectra(State, CL, lmin, lmax, .not. CP%Accuracy%AccurateBB, &
+            CPP, Cphil3, CTT, CEE, CTE)
+        if (global_error_flag /= 0) return
+
+        thread_ix = 1
+        !$ thread_ix = OMP_GET_MAX_THREADS()
+        allocate(lens_contrib(4,CLout%lmax_lensed,thread_ix), source = 0._dl)
+
+        if (DebugMsgs) call Timer%Start()
+
+        !$OMP PARALLEL DEFAULT(PRIVATE), &
+        !$OMP SHARED(lmin,lmax,imin,npoints,xvals,weights,lens_contrib,CLout), &
+        !$OMP SHARED(Cphil3,CTT,CEE,CTE,lfacs,lfacs2,invlfacs,invlfacs2,invlrootfacs), &
+        !$OMP SHARED(rootfac1,invrootfac1,rootfac2,invrootfac2,invrootfac3,rootrat,invlfacsm12), &
+        !$OMP SHARED(theta_cut,apodize_theta_width,xtaper_start,theta_max)
+        thread_ix = 1
+        !$ thread_ix = OMP_GET_THREAD_NUM()+1
+        !$OMP DO
+        do i=imin, npoints
+            x = xvals(i)
+            weight = weights(i)
+            theta = acos(x)
+            if (apodize_theta_width > 0._dl .and. x < xtaper_start) then
+                taper = max(0._dl,min(1._dl,(theta_max - theta)/apodize_theta_width))
+                weight = weight*taper**3*(10._dl + taper*(-15._dl + 6._dl*taper))
+            end if
+
+            fac1 = 1._dl - x
+            fac2 = 1._dl + x
+            sin2 = max(1e-30_dl,1._dl - x**2)
+            rsin2 = 1._dl/sin2
+            sinth = sqrt(sin2)
+            sinfac = 4._dl/sinth
+            ffac = fac1/fac2
+            rfac = fac2/fac1
+            tfac1 = 2._dl/fac1
+            tfac2 = 2._dl/fac2
+            c22fac = (4._dl*x - 8._dl)/fac2
+            c2m2fac = (4._dl*x + 8._dl)/fac1
+            d2m4fac = (6._dl*x + 4._dl)/sinth
+            d4m4fac = (9._dl*x + 26._dl)/fac1
+
+            P(1) = x
+            dP(1) = 1._dl
+            d11(1) = fac1*dP(1)*invlfacs(1) + P(1)
+            dm11(1) = fac2*dP(1)*invlfacs(1) - P(1)
+            sigma2 = 0._dl
+            Cg2 = 0._dl
+            if (lmin <= 1) then
+                sigma2 = (1._dl - d11(1))*Cphil3(1)
+                Cg2 = dm11(1)*Cphil3(1)
+            end if
+            pmm = 1._dl
+            pmmp1 = x
+            do l=2,lmax
+                P(l)= ((2*l-1)*x*pmmp1 - (l-1)*pmm)/l
+                dP(l) = l*(pmmp1 - x*P(l))*rsin2
+                pmm = pmmp1
+                pmmp1 = P(l)
+
+                d11(l) = fac1*dP(l)*invlfacs(l) + P(l)
+                dm11(l) = fac2*dP(l)*invlfacs(l) - P(l)
+
+                sigma2 = sigma2 + (1._dl - d11(l))*Cphil3(l)
+                Cg2 = Cg2 + dm11(l)*Cphil3(l)
+
+                d22(l) = ((c22fac + lfacs(l))*P(l) + 4._dl*ffac*(fac2 + (x - 2._dl)*invlfacs(l))*dP(l))*invlfacs2(l)
+                !For small theta use Taylor expansion for better stability
+                if (theta > theta_cut(l)) then
+                    d2m2(l) = ((lfacs(l) - c2m2fac)*P(l) + 4._dl*rfac*(-fac1 + (x + 2._dl)*invlfacs(l))*dP(l))*invlfacs2(l)
+                else
+                    d2m2(l) = lfacs(l)*lfacs2(l)*sin2**2/7680._dl*(20._dl + sin2*(16._dl - lfacs(l)))
+                end if
+                d20(l) = (2._dl*x*dP(l) - lfacs(l)*P(l))*invlrootfacs(l)
+            end do
+
+            !Non-perturbative isotropic factor exp(-l(l+1)sigma2/2) by multiplicative
+            !recurrence: one exp per point rather than per l, with relative error
+            !growing only like l*epsilon (and harmless gradual underflow to zero).
+            corr = 0._dl
+            expsig = exp(-sigma2)
+            expl = expsig      ! exp(-l*sigma2)
+            facexp = expsig    ! exp(-lfacs(l)*sigma2/2), starting at l=1
+            if (lmin <= 1) then
+                c2fac = lfacs(1)*Cg2/2._dl
+                corr(1) = CTT(1)*((facexp - 1._dl)*P(1) + facexp*c2fac*(dm11(1) + c2fac*P(1)/4._dl))
+            end if
+            do l=2,lmax
+                expl = expl*expsig
+                facexp = facexp*expl
+                c2fac = lfacs(l)*Cg2/2._dl
+                c2fac2 = c2fac**2
+                corr(1) = corr(1) + CTT(l)*((facexp - 1._dl)*P(l) + &
+                    facexp*(c2fac*(dm11(l) + c2fac*P(l)/4._dl) + c2fac2*d2m2(l)/4._dl))
+                fEE = CEE(l)*facexp
+                fTE = CTE(l)*facexp
+                corr(2) = corr(2) + CEE(l)*(facexp - 1._dl)*d22(l) + fEE*c2fac2*d22(l)/4._dl
+                corr(3) = corr(3) + CEE(l)*(facexp - 1._dl)*d2m2(l) + &
+                    fEE*(c2fac*dm11(l)/2._dl + c2fac2*(2._dl*d2m2(l) + P(l))/8._dl)
+                corr(4) = corr(4) + CTE(l)*(facexp - 1._dl)*d20(l) + &
+                    fTE*(c2fac*d11(l)/2._dl + 3._dl*c2fac2*d20(l)/8._dl)
+                if (l >= 3) then
+                    !Higher d's are only needed pointwise, computed here from the stored arrays
+                    d1m2 = sinth*invrootfac1(l)*(dP(l) - tfac1*dm11(l))
+                    d12 = sinth*invrootfac1(l)*(dP(l) - tfac2*d11(l))
+                    d1m3 = -(x + 0.5_dl)*sinfac*d1m2*invrootfac2(l) - rootrat(l)*dm11(l)
+                    d2m3 = (-fac2*d2m2(l)*sinfac - rootfac1(l)*d1m2)*invrootfac2(l)
+                    d3m3 = (-(x + 1.5_dl)*d2m3*sinfac - rootfac1(l)*d1m3)*invrootfac2(l)
+                    d13 = (x - 0.5_dl)*sinfac*d12*invrootfac2(l) - rootrat(l)*d11(l)
+                    corr(2) = corr(2) + fEE*c2fac*d13
+                    corr(3) = corr(3) + fEE*c2fac*d3m3/2._dl
+                    corr(4) = corr(4) + fTE*c2fac*d1m3/2._dl
+                    if (l >= 4) then
+                        d04 = ((-lfacs(l) + (18._dl*x**2 + 6._dl)*rsin2)*d20(l) - &
+                            6._dl*x*lfacs2(l)*dP(l)*invlrootfacs(l))*(invrootfac2(l)*invrootfac3(l))
+                        d2m4 = (-d2m4fac*d2m3 - rootfac2(l)*d2m2(l))*invrootfac3(l)
+                        d4m4 = (-7._dl/5._dl*(lfacs(l) - 6._dl)*d2m2(l) + &
+                            12._dl/5._dl*(-lfacs(l) + d4m4fac)*d3m3)*invlfacsm12(l)
+                        corr(2) = corr(2) + fEE*c2fac2*d04/4._dl
+                        corr(3) = corr(3) + fEE*c2fac2*d4m4/8._dl
+                        corr(4) = corr(4) + fTE*c2fac2*d2m4/8._dl
+                    end if
+                end if
+            end do
+
+            wcorr1 = weight*corr(1)
+            wcorr2 = weight*corr(2)/2._dl
+            wcorr3 = weight*corr(3)/2._dl
+            wcorr4 = weight*corr(4)
+            if (lmin <= 1 .and. CLout%lmax_lensed >= 1) then
+                lens_contrib(CT_Temp,1,thread_ix) = lens_contrib(CT_Temp,1,thread_ix) + wcorr1*P(1)
+            end if
+            do l=max(2,lmin), CLout%lmax_lensed
+                lens_contrib(CT_Temp,l,thread_ix) = lens_contrib(CT_Temp,l,thread_ix) + wcorr1*P(l)
+                T2 = wcorr2*d22(l)
+                T4 = wcorr3*d2m2(l)
+                lens_contrib(CT_E,l,thread_ix) = lens_contrib(CT_E,l,thread_ix) + T2 + T4
+                lens_contrib(CT_B,l,thread_ix) = lens_contrib(CT_B,l,thread_ix) + T2 - T4
+                lens_contrib(CT_Cross,l,thread_ix) = lens_contrib(CT_Cross,l,thread_ix) + wcorr4*d20(l)
+            end do
+
+        end do
+        !$OMP END DO
+        !$OMP END PARALLEL
+
+        if (lmin <= 1 .and. CLout%lmax_lensed >= 1) then
+            contrib_sum = 0._dl
+            do thread_ix = 1, size(lens_contrib, 3)
+                contrib_sum = contrib_sum + lens_contrib(:, 1, thread_ix)
+            end do
+            CLout%Cl_lensed(1,CT_Temp) = contrib_sum(CT_Temp)*2._dl*const_twopi/OutputDenominator &
+                + CL%Cl_scalar(1,C_Temp)
+            CLout%Cl_lensed(1,CT_E) = CL%Cl_scalar(1,C_E)
+            CLout%Cl_lensed(1,CT_B) = 0._dl
+            CLout%Cl_lensed(1,CT_Cross) = CL%Cl_scalar(1,C_Cross)
+        end if
+        do l=max(2,lmin), CLout%lmax_lensed
+            contrib_sum = 0._dl
+            do thread_ix = 1, size(lens_contrib, 3)
+                contrib_sum = contrib_sum + lens_contrib(:, l, thread_ix)
+            end do
+            fac = lfacs(l)*const_twopi/OutputDenominator
+            CLout%Cl_lensed(l,CT_Temp) = contrib_sum(CT_Temp)*fac + CL%Cl_scalar(l,C_Temp)
+            CLout%Cl_lensed(l,CT_E) = contrib_sum(CT_E)*fac + CL%Cl_scalar(l,C_E)
+            CLout%Cl_lensed(l,CT_B) = contrib_sum(CT_B)*fac
+            CLout%Cl_lensed(l,CT_Cross) = contrib_sum(CT_Cross)*fac + CL%Cl_scalar(l,C_Cross)
+        end do
+
+        if (DebugMsgs) call Timer%WriteTime('Time for full corr lensing')
+    end associate
+
+    end subroutine CorrFuncFullSky
 
     subroutine CorrFuncFlatSky(State)
     !Do flat sky approx partially non-perturbative lensing, lensing_method=2
@@ -553,9 +911,6 @@
     integer, parameter :: bess_need(4) = (/ 0,2,4,6 /)
     integer thread_ix
     Type(TTimer) :: Timer
-
-    !$ integer OMP_GET_THREAD_NUM, OMP_GET_MAX_THREADS
-    !$ external OMP_GET_THREAD_NUM, OMP_GET_MAX_THREADS
 
     if (lensing_includes_tensors) stop 'Haven''t implemented tensor lensing'
 
@@ -609,9 +964,12 @@
 
         lens_contrib=0
 
-        !$OMP PARALLEL DO DEFAULT(SHARED), &
+        !$OMP PARALLEL DEFAULT(SHARED), &
         !$OMP PRIVATE(theta, sigmasq,cgl2,b_lo,a0,b0,fac,fac1,fac2), &
         !$OMP PRIVATE(Bessel,ix,corr,expsig,C2term,T2,T4,i,l, thread_ix)
+        thread_ix = 1
+        !$ thread_ix = OMP_GET_THREAD_NUM()+1
+        !$OMP DO
         do i=1,npoints-1
 
             theta = i * dtheta
@@ -671,8 +1029,6 @@
 
             end do
 
-            !$ thread_ix = OMP_GET_THREAD_NUM()+1
-
             do l=lmin, CL%lmax_lensed
                 !theta factors were put in earlier (already in corr)
                 lens_contrib(C_Temp, l, thread_ix)= lens_contrib(C_Temp,l, thread_ix) + &
@@ -686,18 +1042,20 @@
             end do
 
         end do
-        !$OMP END PARALLEL DO
+        !$OMP END DO
+        !$OMP END PARALLEL
 
         do l=lmin, CL%lmax_lensed
+            corr = 0._dl
+            do thread_ix = 1, size(lens_contrib, 3)
+                corr = corr + lens_contrib(:, l, thread_ix)
+            end do
             fac = l*(l+1)* const_twopi/OutputDenominator*dtheta
-            CL%Cl_lensed(l,CT_Temp) = sum(lens_contrib(CT_Temp,l,:))*fac &
-                + CL%Cl_scalar(l,CT_Temp)
-            CL%Cl_lensed(l,CT_Cross) = sum(lens_contrib(CT_Cross,l,:))*fac &
-                +CL%Cl_scalar(l,C_Cross)
+            CL%Cl_lensed(l,CT_Temp) = corr(CT_Temp)*fac + CL%Cl_scalar(l,CT_Temp)
+            CL%Cl_lensed(l,CT_Cross) = corr(CT_Cross)*fac +CL%Cl_scalar(l,C_Cross)
             fac = fac /2 !(factor of 1/2 should have been in T2+/-T4 above
-            CL%Cl_lensed(l,CT_E) = sum(lens_contrib(CT_E,l,:))*fac &
-                + CL%Cl_scalar(l,CT_E)
-            CL%Cl_lensed(l,CT_B) = sum(lens_contrib(CT_B,l,:))*fac
+            CL%Cl_lensed(l,CT_E) = corr(CT_E)*fac + CL%Cl_scalar(l,CT_E)
+            CL%Cl_lensed(l,CT_B) = corr(CT_B)*fac
         end do
 
         deallocate(lens_contrib)
@@ -744,12 +1102,9 @@
     real(dl) T2,T4,a0, b0
     real(dl) lfacs(State%CP%Max_l), LensAccuracyBoost
     real(dl), allocatable, dimension(:,:,:) :: lens_contrib(:,:,:)
-    integer, parameter :: bess_need(8) = (/ 0,1,2,3,4, 5,7,9 /)
+    integer, parameter :: bess_need(8) = (/ 0,1,2,3,4,5,7,9 /)
     integer thread_ix
     Type(TTimer) :: Timer
-
-    !$ integer OMP_GET_THREAD_NUM, OMP_GET_MAX_THREADS
-    !$ external OMP_GET_THREAD_NUM, OMP_GET_MAX_THREADS
 
     if (lensing_includes_tensors) stop 'Haven''t implemented tensor lensing'
 
@@ -786,9 +1141,12 @@
             return
         end if
 
-        !$OMP PARALLEL DO DEFAULT(SHARED), &
+        !$OMP PARALLEL DEFAULT(SHARED), &
         !$OMP PRIVATE(theta, sigmasq,cgl2,b_lo,a0,b0,fac,fac1,fac2), &
         !$OMP PRIVATE(Bessel,ix,corr,expsig,C2term,T2,T4,i,l, thread_ix)
+        thread_ix = 1
+        !$ thread_ix = OMP_GET_THREAD_NUM()+1
+        !$OMP DO
         do i=1,npoints-1
 
             theta = i * dtheta
@@ -860,8 +1218,6 @@
 
             end do
 
-            !$ thread_ix = OMP_GET_THREAD_NUM()+1
-
             do l=lmin, CL%lmax_lensed
                 !theta factors were put in earlier (already in corr)
 
@@ -891,19 +1247,24 @@
             end do
 
         end do
-        !$OMP END PARALLEL DO
+        !$OMP END DO
+        !$OMP END PARALLEL
 
         CGrads = 0
         do l=lmin, min(CL%lmax_lensed, lmax)
+            corr = 0._dl
+            do thread_ix = 1, size(lens_contrib, 3)
+                corr = corr + lens_contrib(:, l, thread_ix)
+            end do
             fac = l*(l+1)* const_twopi/OutputDenominator*dtheta
-            CGrads(1,l) = sum(lens_contrib(1,l,:))*fac + CL%Cl_scalar(l,CT_Temp)
-            CGrads(2,l) = sum(lens_contrib(2,l,:))*fac + CL%Cl_scalar(l,CT_E)
-            CGrads(3,l) = sum(lens_contrib(3,l,:))*fac !BB
-            CGrads(4,l) = sum(lens_contrib(4,l,:))*fac !Perp
-            CGrads(5,l) = sum(lens_contrib(5,l,:))*fac + CL%Cl_scalar(l,C_Cross)
-            CGrads(6,l) = sum(lens_contrib(6,l,:))*fac
-            CGrads(7,l) = sum(lens_contrib(7,l,:))*fac + CL%Cl_scalar(l,CT_Temp)
-            CGrads(8,l) = sum(lens_contrib(8,l,:))*fac + CL%Cl_scalar(l,CT_Temp)
+            CGrads(1,l) = corr(1)*fac + CL%Cl_scalar(l,CT_Temp)
+            CGrads(2,l) = corr(2)*fac + CL%Cl_scalar(l,CT_E)
+            CGrads(3,l) = corr(3)*fac !BB
+            CGrads(4,l) = corr(4)*fac !Perp
+            CGrads(5,l) = corr(5)*fac + CL%Cl_scalar(l,C_Cross)
+            CGrads(6,l) = corr(6)*fac
+            CGrads(7,l) = corr(7)*fac + CL%Cl_scalar(l,CT_Temp)
+            CGrads(8,l) = corr(8)*fac + CL%Cl_scalar(l,CT_Temp)
         end do
 
         deallocate(lens_contrib)
@@ -1135,6 +1496,7 @@
     end subroutine BadHarmonic
 
     subroutine GetBessels(MaxArg)
+    use Interpolation, only : cubic_spline_second_derivs
     real(dl), intent(in):: MaxArg
     integer i
     real(dl), allocatable, dimension(:) :: x
@@ -1158,105 +1520,13 @@
             Bess(i,:)=Bessel_jn(0, maxbessel,x(i))
         end do
         do ix=0,maxbessel
-            call spline_def(x,Bess(:,ix),max_bes_ix,ddBess(:,ix))
+            call cubic_spline_second_derivs(x,Bess(:,ix),max_bes_ix,ddBess(:,ix))
         end do
 
         deallocate(x)
     end if
 
     end subroutine GetBessels
-
-    ! ----------------------------------------------------------------------
-    ! Auxiliary Bessel functions for N=0, N=1
-    FUNCTION BESSI0(X)
-    double precision X,BESSI0,Y,P1,P2,P3,P4,P5,P6,P7,  &
-        Q1,Q2,Q3,Q4,Q5,Q6,Q7,Q8,Q9,AX,BX
-    DATA P1,P2,P3,P4,P5,P6,P7/1.D0,3.5156229D0,3.0899424D0,1.2067429D0,  &
-        0.2659732D0,0.360768D-1,0.45813D-2/
-    DATA Q1,Q2,Q3,Q4,Q5,Q6,Q7,Q8,Q9/0.39894228D0,0.1328592D-1, &
-        0.225319D-2,-0.157565D-2,0.916281D-2,-0.2057706D-1,  &
-        0.2635537D-1,-0.1647633D-1,0.392377D-2/
-    IF(ABS(X).LT.3.75D0) THEN
-        Y=(X/3.75D0)**2
-        BESSI0=P1+Y*(P2+Y*(P3+Y*(P4+Y*(P5+Y*(P6+Y*P7)))))
-    ELSE
-        AX=ABS(X)
-        Y=3.75D0/AX
-        BX=EXP(AX)/SQRT(AX)
-        AX=Q1+Y*(Q2+Y*(Q3+Y*(Q4+Y*(Q5+Y*(Q6+Y*(Q7+Y*(Q8+Y*Q9)))))))
-        BESSI0=AX*BX
-    ENDIF
-    RETURN
-    END FUNCTION BESSI0
-    ! ----------------------------------------------------------------------
-    FUNCTION BESSI1(X)
-    double precision X,BESSI1,Y,P1,P2,P3,P4,P5,P6,P7,  &
-        Q1,Q2,Q3,Q4,Q5,Q6,Q7,Q8,Q9,AX,BX
-    DATA P1,P2,P3,P4,P5,P6,P7/0.5D0,0.87890594D0,0.51498869D0,  &
-        0.15084934D0,0.2658733D-1,0.301532D-2,0.32411D-3/
-    DATA Q1,Q2,Q3,Q4,Q5,Q6,Q7,Q8,Q9/0.39894228D0,-0.3988024D-1, &
-        -0.362018D-2,0.163801D-2,-0.1031555D-1,0.2282967D-1, &
-        -0.2895312D-1,0.1787654D-1,-0.420059D-2/
-    IF(ABS(X).LT.3.75D0) THEN
-        Y=(X/3.75D0)**2
-        BESSI1=X*(P1+Y*(P2+Y*(P3+Y*(P4+Y*(P5+Y*(P6+Y*P7))))))
-    ELSE
-        AX=ABS(X)
-        Y=3.75D0/AX
-        BX=EXP(AX)/SQRT(AX)
-        AX=Q1+Y*(Q2+Y*(Q3+Y*(Q4+Y*(Q5+Y*(Q6+Y*(Q7+Y*(Q8+Y*Q9)))))))
-        BESSI1=AX*BX
-    ENDIF
-    RETURN
-    END FUNCTION BESSI1
-
-
-    FUNCTION BESSI(N,X)
-    !from http://perso.orange.fr/jean-pierre.moreau/Fortran/tbessi_f90.txt
-    !
-    !     This subroutine calculates the first kind modified Bessel function
-    !     of integer order N, for any REAL X. We use here the classical
-    !     recursion formula, when X > N. For X < N, the Miller's algorithm
-    !     is used to avoid overflows.
-    !     REFERENCE:
-    !     C.W.CLENSHAW, CHEBYSHEV SERIES FOR MATHEMATICAL FUNCTIONS,
-    !     MATHEMATICAL TABLES, VOL.5, 1962.
-    integer, intent(in) :: N
-    integer, PARAMETER :: IACC = 40
-    integer m,j
-    double precision, parameter ::  BIGNO = 1.D10, BIGNI = 1.D-10
-    double precision X,BESSI,TOX,BIM,BI,BIP
-    IF (N.EQ.0) THEN
-        BESSI = BESSI0(X)
-        RETURN
-    ENDIF
-    IF (N.EQ.1) THEN
-        BESSI = BESSI1(X)
-        RETURN
-    ENDIF
-    IF(X.EQ.0.D0) THEN
-        BESSI=0.D0
-        RETURN
-    ENDIF
-    TOX = 2.D0/X
-    BIP = 0.D0
-    BI  = 1.D0
-    BESSI = 0.D0
-    M = 2*((N+INT(SQRT(FLOAT(IACC*N)))))
-    DO J = M,1,-1
-        BIM = BIP+ J*TOX*BI
-        BIP = BI
-        BI  = BIM
-        IF (ABS(BI).GT.BIGNO) THEN
-            BI  = BI*BIGNI
-            BIP = BIP*BIGNI
-            BESSI = BESSI*BIGNI
-        ENDIF
-        IF (J.EQ.N) BESSI = BIP
-    END DO
-    BESSI = BESSI*BESSI0(X)/BI
-    RETURN
-    END FUNCTION BESSI
 
 
     end module lensing

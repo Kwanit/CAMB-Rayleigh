@@ -65,6 +65,8 @@
 
         real(dl) :: BackgroundTimeStepBoost = 1._dl !number of time steps for background thermal history interpolation
 
+        real(dl) :: TimeSwitchBoost = 1._dl !Accuracy for physical time/transition switches
+
         real(dl) :: IntTolBoost = 1._dl !Tolerances for integrating differential equations
 
         real(dl) :: SourcekAccuracyBoost = 1._dl !Accuracy of k sampling for source time integration
@@ -127,6 +129,10 @@
         integer   :: Min_l = 2 ! 1 or larger, usually 1 or 2
         integer   :: Max_l = 2500
         integer   :: Max_l_tensor = 600
+        integer   :: lens_output_margin = 200
+        !Number of L below Max_l down to which lensed C_L are guaranteed to be output;
+        !the unlensed C_L used in the lensing convolution is treated as reliable to
+        !Max_l - (lens_output_margin - 50), so this also fixes the lensed convolution margin.
         real(dl)  :: Max_eta_k = 5000
         real(dl)  :: Max_eta_k_tensor = 1200
         ! _tensor settings only used in initialization,

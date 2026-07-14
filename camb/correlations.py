@@ -12,6 +12,8 @@ factors :math:`\ell(\ell+1)/2\pi` (for CMB) and :math:`[L(L+1)]^2/2\pi` (for len
 A. Lewis December 2016
 """
 
+import os.path as osp
+
 import numpy as np
 
 try:
@@ -23,14 +25,71 @@ try:
 except ImportError:
     from scipy.special import lpn as legendrep
 
+
 try:
-    from .mathutils import gauss_legendre
+    from .mathutils import gauss_legendre, legendre_polynomials
 except ImportError:
-    # use np.polynomial.legendre if can't load fast native (so can use module without compiling camb)
-    # Fortran version is much faster than current np.polynomial
+    # use np.polynomial.legendre/scipy if can't load fast native (so can use module without compiling camb)
+    # Fortran versions are much faster than current np.polynomial and per-point scipy
     gauss_legendre = None  # type: ignore
+    legendre_polynomials = None  # type: ignore
 
 _gauss_legendre_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+_lensing_template_cache = None
+
+
+def _lensing_template():
+    global _lensing_template_cache
+    if _lensing_template_cache is None:
+        template = osp.join(osp.dirname(__file__), "HighLExtrapTemplate_lenspotentialCls.dat")
+        if not osp.exists(template):
+            template = osp.abspath(
+                osp.join(osp.dirname(__file__), "..", "fortran", "HighLExtrapTemplate_lenspotentialCls.dat")
+            )
+        data = np.loadtxt(template)
+        lmax = int(data[-1, 0])
+        template_cls = np.zeros((lmax + 1, 5))
+        ell = data[:, 0].astype(int)
+        template_cls[ell, :4] = data[:, 1:5]
+        template_cls[ell, 4] = data[:, 5]
+        template_cls.flags.writeable = False
+        _lensing_template_cache = template_cls
+    return _lensing_template_cache
+
+
+def _extrapolate_lensing_inputs(cls, clpp, lmax):
+    cls_lmax = cls.shape[0] - 1
+    clpp_lmax = clpp.shape[0] - 1
+    if lmax <= cls_lmax and lmax <= clpp_lmax:
+        return cls, clpp
+
+    template = _lensing_template()
+    if lmax >= template.shape[0]:
+        raise ValueError(f"High-L lensing template only goes to lmax={template.shape[0] - 1}")
+
+    cls_out = np.zeros((lmax + 1, 4), dtype=np.float64)
+    cls_out[: min(cls_lmax, lmax) + 1] = cls[: min(cls_lmax, lmax) + 1]
+    clpp_out = np.zeros(lmax + 1, dtype=np.float64)
+    clpp_out[: min(clpp_lmax, lmax) + 1] = clpp[: min(clpp_lmax, lmax) + 1]
+
+    if lmax > cls_lmax:
+        if cls_lmax < 2:
+            raise ValueError("CMB cls must include l>=2 to extrapolate with the high-L template")
+        tt_scale = cls_out[cls_lmax, 0] / template[cls_lmax, 0]
+        ee_scale = cls_out[cls_lmax, 1] / template[cls_lmax, 1]
+        te_scale = np.sqrt(max(0.0, tt_scale * ee_scale))
+        cls_out[cls_lmax + 1 :, 0] = template[cls_lmax + 1 : lmax + 1, 0] * tt_scale
+        cls_out[cls_lmax + 1 :, 1] = template[cls_lmax + 1 : lmax + 1, 1] * ee_scale
+        cls_out[cls_lmax + 1 :, 2] = template[cls_lmax + 1 : lmax + 1, 2]
+        cls_out[cls_lmax + 1 :, 3] = template[cls_lmax + 1 : lmax + 1, 3] * te_scale
+
+    if lmax > clpp_lmax:
+        if clpp_lmax < 2:
+            raise ValueError("clpp must include l>=2 to extrapolate with the high-L template")
+        clpp_scale = clpp_out[clpp_lmax] / template[clpp_lmax, 4]
+        clpp_out[clpp_lmax + 1 :] = template[clpp_lmax + 1 : lmax + 1, 4] * clpp_scale
+
+    return cls_out, clpp_out
 
 
 def _cached_gauss_legendre(npoints, cache=True):
@@ -50,6 +109,27 @@ def _cached_gauss_legendre(npoints, cache=True):
         return xvals, weights
 
 
+def _apodize_theta_width(theta_max, lmax, apodize_point_width):
+    if theta_max is None or apodize_point_width <= 0:
+        return 0.0
+    return min(theta_max, 4.8 * float(apodize_point_width) * np.pi / lmax)
+
+
+def _c2_apodized_weight(weight, theta, theta_max, apodize_theta_width):
+    if apodize_theta_width <= 0 or theta <= theta_max - apodize_theta_width:
+        return weight
+    taper = np.clip((theta_max - theta) / apodize_theta_width, 0.0, 1.0)
+    return weight * taper**3 * (10.0 + taper * (-15.0 + 6.0 * taper))
+
+
+def _low_l_ee_taper(lmax):
+    # Smoothstep from zero at l=2 to one at l>=20, matching the Fortran LowLEELensingTaper.
+    # Used to remove the reionization-bump EE from the lensing kernel, whose low-L lensed
+    # BB contribution is otherwise window-sensitive with a truncated integration range.
+    taper = np.clip((np.arange(2, lmax + 1, dtype=np.float64) - 2) / 18, 0, 1)
+    return taper**2 * (3 - 2 * taper)
+
+
 def legendre_funcs(lmax, x, m=(0, 2), lfacs=None, lfacs2=None, lrootfacs=None):
     r"""
     Utility function to return array of Legendre and :math:`d_{mn}` functions for all :math:`\ell` up to lmax.
@@ -64,7 +144,10 @@ def legendre_funcs(lmax, x, m=(0, 2), lfacs=None, lfacs2=None, lrootfacs=None):
     :return: :math:`(P,P'),(d_{11},d_{-1,1}), (d_{20}, d_{22}, d_{2,-2})` as requested, where P starts
              at :math:`\ell=0`, but spin functions start at :math:`\ell=\ell_{\rm min}`
     """
-    allP, alldP = legendrep(lmax, x)
+    if legendre_polynomials is not None:
+        allP, alldP = legendre_polynomials(x, lmax)
+    else:
+        allP, alldP = legendrep(lmax, x)
     # Polarization functions all start at L=2
     fac1 = 1 - x
     fac2 = 1 + x
@@ -247,7 +330,17 @@ def lensing_R(clpp, lmax=None):
     return np.sum(cphil3)
 
 
-def lensed_correlations(cls, clpp, xvals, weights=None, lmax=None, delta=False, theta_max=None, apodize_point_width=10):
+def lensed_correlations(
+    cls,
+    clpp,
+    xvals,
+    weights=None,
+    lmax=None,
+    delta=False,
+    theta_max=None,
+    apodize_point_width=10,
+    low_l_ee_taper=False,
+):
     r"""
     Get the lensed correlation function from the unlensed power spectra, evaluated at
     points :math:`\cos(\theta)` = xvals.
@@ -268,7 +361,10 @@ def lensed_correlations(cls, clpp, xvals, weights=None, lmax=None, delta=False, 
     :param lmax: optional maximum L to use from the cls arrays
     :param delta: if true, calculate the difference between lensed and unlensed (default False)
     :param theta_max: maximum angle (in radians) to keep in the correlation functions
-    :param apodize_point_width: smoothing scale for apodization at truncation of correlation function
+    :param apodize_point_width: scale factor for the fixed-angle C2 apodization at the truncation cut;
+        the default corresponds to a transition width of about 48*pi/lmax
+    :param low_l_ee_taper: smoothly taper the reionization-bump EE (l<20) out of the lensing kernel, matching
+        the Fortran short-range convention; otherwise its low-L lensed BB is window-sensitive when theta_max is set
     :return: 2D array of corrs[i, ix], where ix=0,1,2,3 are T, Q+U, Q-U and cross;
         if weights is not None, then return corrs, lensed_cls
     """
@@ -286,8 +382,12 @@ def lensed_correlations(cls, clpp, xvals, weights=None, lmax=None, delta=False, 
 
     ct = facs * cls[: lmax + 1, 0]
     # For polarization, all arrays start at 2
-    cp = facs[2:] * (cls[2 : lmax + 1, 1] + cls[2 : lmax + 1, 2])
-    cm = facs[2:] * (cls[2 : lmax + 1, 1] - cls[2 : lmax + 1, 2])
+    ee = cls[2 : lmax + 1, 1]
+    if low_l_ee_taper:
+        # taper only the convolution kernel; any unlensed EE added back is unchanged
+        ee = ee * _low_l_ee_taper(lmax)
+    cp = facs[2:] * (ee + cls[2 : lmax + 1, 2])
+    cm = facs[2:] * (ee - cls[2 : lmax + 1, 2])
     cc = facs[2:] * cls[2 : lmax + 1, 3]
     ls = ls[2:]
     lfacs = lfacs[2:]
@@ -307,8 +407,10 @@ def lensed_correlations(cls, clpp, xvals, weights=None, lmax=None, delta=False, 
     if theta_max is not None:
         xmin = np.cos(theta_max)
         imin = np.searchsorted(xvals, xmin)  # assume xvals sorted
+        apodize_theta_width = _apodize_theta_width(theta_max, lmax, apodize_point_width)
     else:
         imin = 0
+        apodize_theta_width = 0.0
 
     corrs = np.zeros((len(xvals[imin:]), 4))
 
@@ -342,8 +444,8 @@ def lensed_correlations(cls, clpp, xvals, weights=None, lmax=None, delta=False, 
             rootfac2[1:] * rootfac3
         )
         d2m4 = (-(6 * x + 4) / sinth * d2m3[1:] - rootfac2[1:] * d2m2[2:]) / rootfac3
-        d4m4 = (-7 / 5.0 * (lfacs2[2:] - 6) * d2m2[2:] + 12 / 5.0 * (-lfacs2[2:] + (9 * x + 26) / fac1) * d3m3[1:]) / (
-            lfacs2[2:] - 12
+        d4m4 = (-7 / 5.0 * (lfacs[2:] - 6) * d2m2[2:] + 12 / 5.0 * (-lfacs[2:] + (9 * x + 26) / fac1) * d3m3[1:]) / (
+            lfacs[2:] - 12
         )
         # + (second order Cg2 terms are needed for <1% accuracy on BB)
         f = cp * fac[2:]
@@ -369,8 +471,8 @@ def lensed_correlations(cls, clpp, xvals, weights=None, lmax=None, delta=False, 
         )
         if weights is not None:
             weight = weights[i + imin]
-            if theta_max is not None and i < apodize_point_width * 4:
-                weight *= 1 - np.exp(-(((i + 1.0) / apodize_point_width) ** 2) / 2)
+            if apodize_theta_width > 0.0:
+                weight = _c2_apodized_weight(weight, np.arccos(x), theta_max, apodize_theta_width)
 
             lensedcls[:, 0] += (weight * corrs[i, 0]) * P
             T2 = (corrs[i, 1] * weight / 2) * d22
@@ -398,6 +500,8 @@ def lensed_cls(
     apodize_point_width=10,
     leggaus=True,
     cache=True,
+    use_lensing_template=False,
+    low_l_ee_taper=False,
 ):
     r"""
     Get the lensed power spectra from the unlensed power spectra and the lensing potential power.
@@ -410,9 +514,10 @@ def lensed_cls(
 
     For a reference implementation with the full integral range and no apodization set theta_max=None.
 
-    Note that this function does not pad high :math:`\ell` with a smooth fit (like CAMB's main functions); for
-    accurate results should be called with lmax high enough that input cls are effectively band limited
-    (lmax >= 2500, or higher for accurate BB to small scales).
+    By default this function does not pad high :math:`\ell` with a smooth fit; for accurate results it should be
+    called with lmax high enough that input cls are effectively band limited (lmax >= 2500, or higher for accurate
+    BB to small scales). Set ``use_lensing_template=True`` to extend inputs above their supplied maximum using
+    CAMB's high-L lensing template, matching the Fortran lensing convention.
     Usually lmax truncation errors are far larger than other numerical errors for lmax<4000.
     For a faster result use get_lensed_cls_with_spectrum.
 
@@ -424,22 +529,35 @@ def lensed_cls(
     :param sampling_factor: npoints = int(sampling_factor*lmax)+1
     :param delta_cls: if true, return the difference between lensed and unlensed (optional, default False)
     :param theta_max: maximum angle (in radians) to keep in the correlation functions; default: pi/32
-    :param apodize_point_width: if theta_max is set, apodize around the cut using half Gaussian of approx
-        width apodize_point_width/lmax*pi
+    :param apodize_point_width: if theta_max is set, scale the fixed-angle C2 apodization around the cut;
+        the default corresponds to a transition width of about 48*pi/lmax
     :param leggaus: whether to use Gauss-Legendre integration (default True)
     :param cache: if leggaus = True, set cache to save the x values and weights between calls (most of the time)
+    :param use_lensing_template: if True, allow lmax above the input arrays by extrapolating TT, EE, TE and PP
+        with the bundled high-L template scaled at the last supplied multipole
+    :param low_l_ee_taper: smoothly taper the reionization-bump EE (l<20) out of the lensing kernel, matching
+        the Fortran short-range convention; otherwise its low-L lensed BB is window-sensitive when theta_max is set
     :return: 2D array of cls[L, ix], with L starting at zero and ix=0,1,2,3 in order TT, EE, BB, TE.
         cls include :math:`\ell(\ell+1)/2\pi` factors.
     """
     if lmax is None:
         lmax = cls.shape[0] - 1
+    cls = np.asarray(cls)
+    clpp = np.asarray(clpp)
+    if cls.ndim == 2 and cls.shape[1] > 4:
+        # only TT, EE, BB, TE columns are used; tolerate extra trailing columns
+        cls = cls[:, :4]
+    if use_lensing_template:
+        cls, clpp = _extrapolate_lensing_inputs(cls, clpp, lmax)
+    elif lmax >= cls.shape[0] or lmax >= clpp.shape[0]:
+        raise ValueError("lmax is larger than the input arrays; set use_lensing_template=True to extrapolate")
     npoints = int(sampling_factor * lmax) + 1
     if leggaus:
         xvals, weights = _cached_gauss_legendre(npoints, cache)
     else:
         theta = np.arange(1, npoints + 1) * np.pi / (npoints + 1)
         xvals = np.cos(theta[::-1])
-        weights = np.pi / npoints * np.sin(theta)
+        weights = np.pi / (npoints + 1) * np.sin(theta)
     _, lensedcls = lensed_correlations(
         cls,
         clpp,
@@ -448,7 +566,8 @@ def lensed_cls(
         lmax,
         delta=True,
         theta_max=theta_max,
-        apodize_point_width=int(apodize_point_width * sampling_factor),
+        apodize_point_width=apodize_point_width,
+        low_l_ee_taper=low_l_ee_taper,
     )
     if not delta_cls:
         lensedcls += cls[: lmax + 1, :]
@@ -472,8 +591,8 @@ def lensed_cl_derivatives(cls, clpp, lmax=None, theta_max=np.pi / 32, apodize_po
     :param clpp: array of :math:`[L(L+1)]^2 C_L^{\phi\phi}/2\pi` lensing potential power spectrum (zero based)
     :param lmax: optional maximum L to use from the cls arrays
     :param theta_max: maximum angle (in radians) to keep in the correlation functions
-    :param apodize_point_width: if theta_max is set, apodize around the cut using half Gaussian of approx
-        width apodize_point_width/lmax*pi
+    :param apodize_point_width: if theta_max is set, scale the fixed-angle C2 apodization around the cut;
+        the default corresponds to a transition width of about 48*pi/lmax
     :param sampling_factor: npoints = int(sampling_factor*lmax)+1
     :return: array dCL[ix, ell, L], where ix=0,1,2,3 are T, EE, BB, TE and result
                is :math:`d[D^{\rm ix}_\ell]/ d (\log C^{\phi}_L)`
@@ -511,8 +630,10 @@ def lensed_cl_derivatives(cls, clpp, lmax=None, theta_max=np.pi / 32, apodize_po
     if theta_max is not None:
         xmin = np.cos(theta_max)
         imin = np.searchsorted(xvals, xmin)  # assume xvals sorted
+        apodize_theta_width = _apodize_theta_width(theta_max, lmax, apodize_point_width)
     else:
         imin = 0
+        apodize_theta_width = 0.0
 
     corrs = np.zeros((4, lmax + 1))
 
@@ -553,8 +674,8 @@ def lensed_cl_derivatives(cls, clpp, lmax=None, theta_max=np.pi / 32, apodize_po
             rootfac2[1:] * rootfac3
         )
         d2m4 = (-(6 * x + 4) / sinth * d2m3[1:] - rootfac2[1:] * d2m2[2:]) / rootfac3
-        d4m4 = (-7 / 5.0 * (lfacs2[2:] - 6) * d2m2[2:] + 12 / 5.0 * (-lfacs2[2:] + (9 * x + 26) / fac1) * d3m3[1:]) / (
-            lfacs2[2:] - 12
+        d4m4 = (-7 / 5.0 * (lfacs[2:] - 6) * d2m2[2:] + 12 / 5.0 * (-lfacs[2:] + (9 * x + 26) / fac1) * d3m3[1:]) / (
+            lfacs[2:] - 12
         )
         # + (second order Cg2 terms are needed for <1% accuracy on BB)
         f = -lfacsall[2:] / 2 * cp * fac[2:]
@@ -595,8 +716,8 @@ def lensed_cl_derivatives(cls, clpp, lmax=None, theta_max=np.pi / 32, apodize_po
         corrs[3, 1:] = (dsigma2 * corr + dCg2 * corr2) * cphil3
 
         weight = weights[i + imin]
-        if theta_max is not None and i < apodize_point_width * 4:
-            weight *= 1 - np.exp(-(((i + 1.0) / apodize_point_width) ** 2) / 2)
+        if apodize_theta_width > 0.0:
+            weight = _c2_apodized_weight(weight, np.arccos(x), theta_max, apodize_theta_width)
 
         dcl[0, :, :] += np.outer(P, (weight * corrs[0, :]))
         T2 = np.outer(d22, (corrs[1, :] * weight / 2))
@@ -626,8 +747,8 @@ def lensed_cl_derivative_unlensed(clpp, lmax=None, theta_max=np.pi / 32, apodize
     :param clpp: array of :math:`[L(L+1)]^2 C_L^{\phi\phi}/2\pi` lensing potential power spectrum (zero based)
     :param lmax: optional maximum L to use from the clpp array
     :param theta_max: maximum angle (in radians) to keep in the correlation functions
-    :param apodize_point_width: if theta_max is set, apodize around the cut using half Gaussian of approx
-        width apodize_point_width/lmax*pi
+    :param apodize_point_width: if theta_max is set, scale the fixed-angle C2 apodization around the cut;
+        the default corresponds to a transition width of about 48*pi/lmax
     :param sampling_factor: npoints = int(sampling_factor*lmax)+1
     :return: array dCL[ix, ell, L], where ix=0,1,2,3 are TT, EE, BB, TE and result is
          :math:`d\left(\Delta D^{\rm ix}_\ell\right) / d D^{{\rm unlens},j}_L` where j[ix] are TT, EE, EE, TE
@@ -665,8 +786,10 @@ def lensed_cl_derivative_unlensed(clpp, lmax=None, theta_max=np.pi / 32, apodize
     if theta_max is not None:
         xmin = np.cos(theta_max)
         imin = np.searchsorted(xvals, xmin)  # assume xvals sorted
+        apodize_theta_width = _apodize_theta_width(theta_max, lmax, apodize_point_width)
     else:
         imin = 0
+        apodize_theta_width = 0.0
 
     corr = np.zeros((4, lmax + 1))
 
@@ -699,8 +822,8 @@ def lensed_cl_derivative_unlensed(clpp, lmax=None, theta_max=np.pi / 32, apodize
             rootfac2[1:] * rootfac3
         )
         d2m4 = (-(6 * x + 4) / sinth * d2m3[1:] - rootfac2[1:] * d2m2[2:]) / rootfac3
-        d4m4 = (-7 / 5.0 * (lfacs2[2:] - 6) * d2m2[2:] + 12 / 5.0 * (-lfacs2[2:] + (9 * x + 26) / fac1) * d3m3[1:]) / (
-            lfacs2[2:] - 12
+        d4m4 = (-7 / 5.0 * (lfacs[2:] - 6) * d2m2[2:] + 12 / 5.0 * (-lfacs[2:] + (9 * x + 26) / fac1) * d3m3[1:]) / (
+            lfacs[2:] - 12
         )
         # + (second order Cg2 terms are needed for <1% accuracy on BB)
 
@@ -722,8 +845,8 @@ def lensed_cl_derivative_unlensed(clpp, lmax=None, theta_max=np.pi / 32, apodize
         corr[3, 4:] += f[2:] * c2fac2[2:] * d2m4 / 8
 
         weight = weights[i + imin]
-        if theta_max is not None and i < apodize_point_width * 4:
-            weight *= 1 - np.exp(-(((i + 1.0) / apodize_point_width) ** 2) / 2)
+        if apodize_theta_width > 0.0:
+            weight = _c2_apodized_weight(weight, np.arccos(x), theta_max, apodize_theta_width)
 
         dcl[0, :, :] += np.outer(P, (weight * corr[0, :]))
         T2 = np.outer(d22, (corr[1, :] * weight / 2))
