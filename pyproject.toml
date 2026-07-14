@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77", "packaging>=24.2", "wheel"]
+requires = ["setuptools>=77", "packaging>=24.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,14 +13,13 @@ readme = "docs/README_pypi.rst"
 license = "LicenseRef-LGPLv3-arxiv"
 license-files = ["LICENCE.txt"]
 dynamic = ["version"]
-requires-python = ">=3.10.0"
+requires-python = ">=3.11.0"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Operating System :: OS Independent",
     "Environment :: Console",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Astronomy",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -31,7 +30,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-docs = ["sphinx>=4.0", "sphinx_rtd_theme>=1.0", "sphinxcontrib-jquery", "sphinx_markdown_builder", "jupytext"]
+docs = [
+    "sphinx>=4.0",
+    "sphinx_rtd_theme>=1.0",
+    "sphinxcontrib-jquery",
+    "sphinxcontrib-programoutput",
+    "sphinx_markdown_builder",
+    "jupytext",
+]
 dev = ["ruff>=0.11.0", "pre-commit>=3.0.0"]
 
 [project.scripts]
@@ -49,7 +55,7 @@ version = { attr = "camb.__version__" }
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 extend-select = ["I"]
@@ -57,6 +63,7 @@ preview = false
 
 [tool.ruff.lint.per-file-ignores]
 "camb/__init__.py" = ["F401", "E402"]
+"camb/camb.py" = ["PLC0414"]
 "camb/emission_angle.py" = ["E741"]
 "fortran/tests/CAMB_test_files.py" = ["E731"]
 "**/*.ipynb" = ["F405", "E501", "F403", "E402"]
