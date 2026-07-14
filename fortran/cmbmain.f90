@@ -54,17 +54,20 @@
 
     use precision
     use results
+    use Interpolation, only : cubic_spline_second_derivs
     use GaugeInterface
     use HypersphericalBesselOlver, only: u_olver, phi_olver
-    use FlatBessels
+    use RungeKuttaDP45Module, only : RungeKuttaDP45Settings
+    use SpherBessels
     use MassiveNu
     use InitialPower
     use SourceWindows
     use Recombination, only: TRecfast
     use RangeUtils
-    use constants
+    use constants, only: const_fourpi, const_pi
     use DarkEnergyInterface
     use MathUtils
+    use RungeKuttaDP45Module, only : RungeKuttaDP45Settings
     implicit none
     private
 
@@ -77,7 +80,7 @@
         integer q_ix
         real(dl) q, dq    !q value we are doing and delta q
         !Contribution to C_l integral from this k
-        real(dl), dimension(:,:), pointer :: Source_q, ddSource_q
+        real(dl), dimension(:,:), pointer :: Source_q
         !Interpolated sources for this k
         integer SourceSteps !number of steps up to where source is zero
     end type IntegrationVars
@@ -88,14 +91,9 @@
     real(dl), dimension(:,:,:), allocatable :: iCl_Array
     !Full covariance at each L (alternative more general arrangement to above)
 
-    real(dl),parameter :: qmin0=0.1_dl
+    real(dl), parameter :: qmin0=0.1_dl
 
     real(dl), parameter :: NEARFLAT_TOL = 1e-3_dl !determines whether near-flat approximations used
-
-    !Evaluate u_olver directly at each source time step, instead of Numerov stepping in chi,
-    !once a single time step would need at least this many Numerov substeps (one u_olver
-    !evaluation costs about the same as 13 substeps, and avoids accumulated phase drift).
-    integer, parameter :: direct_olver_min_substeps = 10
 
     real(dl) :: dtaurec_q
 
@@ -108,12 +106,15 @@
     integer maximum_l !Max value of l to compute
     real(dl) :: maximum_qeta = 3000._dl
 
-    integer :: l_smooth_sample = 3000 !assume transfer functions effectively small for k*chi0>2*l_smooth_sample
-
-    real(dl), parameter :: xlimmin=35._dl, xlimfrac = 0.05_dl
+    integer :: l_smooth_sample = 3000 !assume transfer functions effectively small for q*DMt0>2*l_smooth_sample
 
     integer :: max_bessels_l_index  = 1000000
     real(dl) :: max_bessels_etak = 1000000*2
+
+    !Evaluate u_olver directly at each source time step, instead of Numerov stepping in chi,
+    !once a single time step would need at least this many Numerov substeps (one u_olver
+    !evaluation costs about the same as 13 substeps, and avoids accumulated phase drift).
+    integer, parameter :: direct_olver_min_substeps = 10
 
     Type(TTimeSources) , pointer :: ThisSources => null()
     Type(TTimeSources), allocatable, target :: TempSources
@@ -244,6 +245,7 @@
     subroutine TimeSourcesToCl(ThisCT)
     Type(ClTransferData) :: ThisCT
     integer q_ix
+    real(dl) :: spline_bessels_etak
     Type(TTimer) :: Timer
 
     if (CP%WantScalars) ThisSources => State%ScalarTimeSources
@@ -261,7 +263,7 @@
     if (global_error_flag==0) then
         call InitSourceInterpolation
 
-        ExactClosedSum = State%curv > 5e-9_dl .or. State%scale < 0.93_dl
+        ExactClosedSum = State%curv > 5e-9_dl .or. State%curv_flat_DM_ratio < 0.93_dl
 
         max_bessels_l_index = ThisCT%ls%nl
         max_bessels_etak  = maximum_qeta
@@ -269,7 +271,13 @@
         if (CP%WantScalars) call GetLimberTransfers(ThisCT)
         ThisCT%max_index_nonlimber = max_bessels_l_index
 
-        if (State%flat) call InitSpherBessels(ThisCT%ls, CP, max_bessels_l_index,max_bessels_etak )
+        if (State%flat .or. State%scale >= 1._dl - near_flat_scale_tol) then
+            spline_bessels_etak = max_bessels_etak
+            if (.not. State%flat) then
+                spline_bessels_etak = ShiftedNuBesselTableMaxEtak(ThisCT%ls%l(max_bessels_l_index), max_bessels_etak)
+            end if
+            call InitSpherBessels(ThisCT%ls, CP, max_bessels_l_index, spline_bessels_etak)
+        end if
         !This is only slow if not called before with same (or higher) Max_l, Max_eta_k
         !Preferably stick to Max_l being a multiple of 50
 
@@ -425,6 +433,8 @@
     if (.not. CP%SourceTerms%limber_windows .or. State%num_redshiftwindows==0 &
         .and. CP%SourceTerms%limber_phi_lmin==0) return
 
+    ! Only if there are extra source windows. Note only flat models supported for sources.
+
     if (ThisCT%ls%l(ThisCT%ls%nl) > 5000) then
         max_bessels_l_index = ThisCT%ls%indexOf(5000)
     else
@@ -535,7 +545,6 @@
     type(IntegrationVars) :: IV
 
     allocate(IV%Source_q(State%TimeSteps%npoints,ThisSources%SourceNum))
-    if (.not.State%flat) allocate(IV%ddSource_q(State%TimeSteps%npoints,ThisSources%SourceNum))
 
     call IntegrationVars_init(IV)
 
@@ -547,7 +556,6 @@
 
     call DoSourceIntegration(IV, ThisCT)
 
-    if (.not.State%flat) deallocate(IV%ddSource_q)
     deallocate(IV%Source_q)
 
     end subroutine SourceToTransfers
@@ -789,18 +797,17 @@
         qmax=maximum_qeta/State%tau0
         qmin=qmin0/State%tau0/initAccuracyBoost
     else
-        qmax=maximum_qeta/State%curvature_radius/(State%DMt0/State%curvature_radius)
-        qmin=qmin0/State%curvature_radius/(State%DMt0/State%curvature_radius)/initAccuracyBoost
+        qmax=maximum_qeta/State%DMt0
+        qmin=qmin0/State%DMt0/initAccuracyBoost
     end if
     !     Timesteps during recombination (tentative, the actual
     !     timestep is the minimum between this value and taurst/40,
-    !     where taurst is the time when recombination starts - see inithermo
+    !     where taurst is the time when recombination starts - see Thermo_Init
 
     dtaurec_q=4/qmax/initAccuracyBoost
-    if (.not. State%flat) dtaurec_q=dtaurec_q/6
     !AL:Changed Dec 2003, dtaurec feeds back into the non-flat integration via the step size
     State%dtaurec = dtaurec_q
-    !dtau rec may be changed by ThermoData_init
+    !dtau rec may be changed by Thermo_Init
 
     max_etak_tensor = initAccuracyBoost*maximum_qeta /10
     max_etak_scalar = initAccuracyBoost*max(1700._dl,maximum_qeta) /20
@@ -859,12 +866,15 @@
     implicit none
     real(dl) dlnk0, dkn1, dkn2, q_switch, q_cmb, dksmooth
     real(dl) qmax_log
-    real(dl) SourceAccuracyBoost
+    real(dl) SourceAccuracyBoost, transferLogDensity
+    logical highPrecisionTransferSources
     !     set k values for which the sources for the anisotropy and
     !     polarization will be calculated. For low values of k we
     !     use a logarithmic spacing. closed case dealt with by SetClosedkValues
 
     SourceAccuracyBoost = CP%Accuracy%AccuracyBoost * CP%Accuracy%SourcekAccuracyBoost
+    highPrecisionTransferSources = AccuracyTarget > 0 .and. CP%Want_CMB .and. CP%WantScalars .and. CP%WantTransfer &
+        .and. CP%Transfer%high_precision
     if (CP%WantScalars .and. CP%Reion%Reionization .and. CP%Accuracy%AccuratePolarization) then
         dlnk0=2._dl/10/SourceAccuracyBoost
         !Need this to get accurate low l polarization
@@ -874,21 +884,32 @@
     end if
 
     if (CP%Accuracy%AccurateReionization) dlnk0 = dlnk0/2
+    !Low-l reionization polarization benefits from a modest cap on the low-k logarithmic source grid.
+    if (AccuracyTarget > 0 .and. CP%Want_CMB .and. CP%WantScalars .and. CP%Reion%Reionization .and. &
+        CP%Accuracy%AccuratePolarization .and. CP%Accuracy%AccurateReionization) dlnk0 = min(dlnk0, 0.075_dl)
+    if (highPrecisionTransferSources) then
+        !High-precision transfer output reuses this CMB source q grid up to q_cmb.
+        !Use 20/log interval for automatic transfer sampling, or the requested denser transfer grid.
+        transferLogDensity = max(20._dl, real(CP%Transfer%k_per_logint, dl))
+        dlnk0 = min(dlnk0, 1._dl/transferLogDensity)
+    end if
 
     dkn1=0.6_dl/State%taurst/SourceAccuracyBoost
     dkn2=0.9_dl/State%taurst/SourceAccuracyBoost/1.2
+
     if (CP%WantTensors .or. CP%WantVectors) then
         dkn1=dkn1  *0.8_dl
         dlnk0=dlnk0/2 !*0.3_dl
         dkn2=dkn2*0.85_dl
     end if
 
-    qmax_log = dkn1/dlnk0
     q_switch = 2*6.3/State%taurst
+    !If the low-k logarithmic grid reaches the horizon-entry switch, skip the intermediate linear interval.
+    qmax_log = min(dkn1/dlnk0, q_switch)
     !Want linear spacing for wavenumbers which come inside horizon
     !Could use sound horizon, but for tensors that is not relevant
 
-    q_cmb = 2*l_smooth_sample/(State%DMt0/State%curvature_radius)*SourceAccuracyBoost  !assume everything is smooth at l > l_smooth_sample
+    q_cmb = 2*l_smooth_sample/State%DMt0*SourceAccuracyBoost  !assume everything is smooth at l > l_smooth_sample
     if (CP%Want_CMB .and. maximum_l > 5000 .and. CP%Accuracy%AccuratePolarization) q_cmb = q_cmb*1.4
     q_cmb = max(q_switch*2, q_cmb)
     !prevent EE going wild in tail
@@ -898,7 +919,7 @@
     associate(Evolve_q => ThisSources%Evolve_q)
         call Evolve_q%Init()
         call Evolve_q%Add_delta(qmin, qmax_log, dlnk0, IsLog = .true.)
-        if (qmax > qmax_log) &
+        if (qmax > qmax_log .and. q_switch > qmax_log) &
             call Evolve_q%Add_delta(qmax_log, min(qmax,q_switch), dkn1)
         if (qmax > q_switch) then
             call Evolve_q%Add_delta(q_switch, min(q_cmb,qmax), dkn2)
@@ -983,7 +1004,8 @@
     type(EvolutionVars) EV
     real(dl) tau,tol1,tauend, taustart
     integer j,ind,itf
-    real(dl) c(24),w(EV%nvar,9), y(EV%nvar), sources(ThisSources%SourceNum)
+    type(RungeKuttaDP45Settings) :: rk_settings
+    real(dl) w(EV%nvar,9), y(EV%nvar), sources(ThisSources%SourceNum)
 
     w=0
     y=0
@@ -996,11 +1018,12 @@
     !     Begin timestep loop.
     itf=1
     tol1=base_tol/exp(CP%Accuracy%AccuracyBoost*CP%Accuracy%IntTolBoost-1)
+
     if (CP%WantTransfer) then
         if  (CP%Transfer%high_precision) tol1=tol1/100
         do while (itf <= State%num_transfer_redshifts .and. State%TimeSteps%points(2) > State%Transfer_Times(itf))
             !Just in case someone wants to get the transfer outputs well before recombination
-            call GaugeInterface_EvolveScal(EV,tau,y,State%Transfer_Times(itf),tol1,ind,c,w)
+            call GaugeInterface_EvolveScal(EV, tau, y, State%Transfer_Times(itf), tol1, ind, rk_settings, w)
             if (global_error_flag/=0) return
             call outtransf(EV,y, tau, State%MT%TransferData(:,EV%q_ix,itf))
             itf = itf+1
@@ -1015,7 +1038,7 @@
             ThisSources%LinearSrc(EV%q_ix,:,j)=0
         else
             !Integrate over time, calulate end point derivs and calc output
-            call GaugeInterface_EvolveScal(EV,tau,y,tauend,tol1,ind,c,w)
+            call GaugeInterface_EvolveScal(EV, tau, y, tauend, tol1, ind, rk_settings, w)
             if (global_error_flag/=0) return
 
             call output(EV,y,j, tau,sources, CP%CustomSources%num_custom_sources)
@@ -1025,7 +1048,8 @@
 101         if (CP%WantTransfer.and.itf <= State%num_transfer_redshifts) then
                 if (j < State%TimeSteps%npoints) then
                     if (tauend < State%Transfer_Times(itf) .and. State%TimeSteps%points(j+1)  > State%Transfer_Times(itf)) then
-                        call GaugeInterface_EvolveScal(EV,tau,y,State%Transfer_Times(itf),tol1,ind,c,w)
+                        call GaugeInterface_EvolveScal(EV, tau, y, State%Transfer_Times(itf), tol1, ind, &
+                            rk_settings, w)
                         if (global_error_flag/=0) return
                     endif
                 end if
@@ -1038,7 +1062,7 @@
                         if (itf <= State%num_transfer_redshifts.and. &
                             State%TimeSteps%points(j+1) > State%Transfer_Times(itf)) goto 101
                     else
-                        if (abs(tau-State%Transfer_Times(itf-1)) > 5.e-5_dl) then
+                        if (abs(tau-State%Transfer_Times(itf-1)) > 5.e-5_dl .and. print_fortran_warnings) then
                             write(*,*) 'WARNING: mismatch in integrated times (CAMB: CalcScalarSources)'
                         end if
                     end if
@@ -1055,7 +1079,8 @@
     type(EvolutionVars) EV
     real(dl) tau,tol,tauend, taustart
     integer j,ind
-    real(dl) c(24),wt(EV%nvart,9), yt(EV%nvart)
+    type(RungeKuttaDP45Settings) :: rk_settings
+    real(dl) wt(EV%nvart,9), yt(EV%nvart)
 
     call initialt(EV,yt, taustart)
 
@@ -1069,7 +1094,7 @@
         if (EV%q*tauend > max_etak_tensor) then
             ThisSources%LinearSrc(EV%q_ix,:,j) = 0
         else
-            call GaugeInterface_EvolveTens(EV,tau,yt,tauend,tol,ind,c,wt)
+            call GaugeInterface_EvolveTens(EV, tau, yt, tauend, tol, ind, rk_settings, wt)
 
             call outputt(EV,yt,EV%nvart,tau,ThisSources%LinearSrc(EV%q_ix,CT_Temp,j),&
                 ThisSources%LinearSrc(EV%q_ix,CT_E,j),ThisSources%LinearSrc(EV%q_ix,CT_B,j))
@@ -1084,13 +1109,14 @@
     type(EvolutionVars) EV
     real(dl) tau,tol,tauend, taustart
     integer j,ind
-    real(dl) c(24),wt(EV%nvarv,9), yv(EV%nvarv)
+    type(RungeKuttaDP45Settings) :: rk_settings
+    real(dl) wt(EV%nvarv,9), yv(EV%nvarv)
 
     call initialv(EV,yv, taustart)
 
     tau=taustart
     ind=1
-    tol=base_tol*0.01/exp(CP%Accuracy%AccuracyBoost*CP%Accuracy%IntTolBoost-1)
+    tol=base_tol/100/exp(CP%Accuracy%AccuracyBoost*CP%Accuracy%IntTolBoost-1)
 
 
     !     Begin timestep loop.
@@ -1100,7 +1126,8 @@
         if ( EV%q*tauend > max_etak_vector) then
             ThisSources%LinearSrc(EV%q_ix,:,j) = 0
         else
-            call dverk(EV,EV%nvarv,derivsv,tau,yv,tauend,tol,ind,c,EV%nvarv,wt) !tauend
+            rk_settings%reuse_first_derivative = .true.
+            call RungeKuttaDP45(EV, EV%nvarv, derivsv, tau, yv, tauend, tol, ind, rk_settings, EV%nvarv, wt)
 
             call outputv(EV,yv,EV%nvarv,tau,ThisSources%LinearSrc(EV%q_ix,CT_Temp,j),&
                 ThisSources%LinearSrc(EV%q_ix,CT_E,j),ThisSources%LinearSrc(EV%q_ix,CT_B,j))
@@ -1146,18 +1173,19 @@
     type(EvolutionVars) EV
     real(dl) tau
     integer ind, i
-    real(dl) c(24),w(EV%nvar,9), y(EV%nvar)
+    type(RungeKuttaDP45Settings) :: rk_settings
+    real(dl) w(EV%nvar,9), y(EV%nvar)
     real(dl) atol
 
     atol=base_tol/exp(CP%Accuracy%AccuracyBoost*CP%Accuracy%IntTolBoost-1)
-    if (CP%Transfer%high_precision) atol=atol/10000 !CHECKTHIS
+    if (CP%Transfer%high_precision) atol=atol/100
 
     ind=1
     call initial(EV,y, tau)
     if (global_error_flag/=0) return
 
     do i=1,State%num_transfer_redshifts
-        call GaugeInterface_EvolveScal(EV,tau,y,State%Transfer_Times(i),atol,ind,c,w)
+        call GaugeInterface_EvolveScal(EV, tau, y, State%Transfer_Times(i), atol, ind, rk_settings, w)
         if (global_error_flag/=0) return
         call outtransf(EV,y,tau,State%MT%TransferData(:,EV%q_ix,i))
     end do
@@ -1195,7 +1223,7 @@
             !Do not use an associate for scaling. It does not work.
             scaling = State%CAMB_Pk%nonlin_ratio(ik,1:State%num_transfer_redshifts)
             if (all(abs(scaling-1) < 5e-4)) cycle
-            call spline_def(State%Transfer_Times, scaling, State%num_transfer_redshifts,ddScaling)
+            call cubic_spline_second_derivs(State%Transfer_Times, scaling, State%num_transfer_redshifts,ddScaling)
 
             tf_lo=1
             tf_hi=tf_lo+1
@@ -1235,7 +1263,7 @@
     !$OMP PARALLEL DO DEFAULT(SHARED), SCHEDULE(STATIC), PRIVATE(i,j)
     do  i=1,State%TimeSteps%npoints
         do j=1, ThisSources%SourceNum
-            call spline_def(ThisSources%Evolve_q%points,ScaledSrc(:,j,i), &
+            call cubic_spline_second_derivs(ThisSources%Evolve_q%points,ScaledSrc(:,j,i), &
                 ThisSources%Evolve_q%npoints, ddScaledSrc(:,j,i))
         end do
     end do
@@ -1249,7 +1277,7 @@
     integer no
     real(dl) dk,dk0,dlnk1, dk2, max_k_dk, k_max_log, k_max_0
     integer lognum
-    real(dl)  qmax_int,IntSampleBoost
+    real(dl)  qmax_int,IntSampleBoost,LowQIntBoost, LowQCurvBoost
 
 
     qmax_int = min(qmax,max_bessels_etak/State%tau0)
@@ -1266,18 +1294,29 @@
 
     if (State%closed.and.ExactClosedSum) then
         call ThisCT%q%Add(3/State%curvature_radius, nint(qmax_int*State%curvature_radius)/State%curvature_radius, &
-            nint(qmax_int*State%curvature_radius)-3) !fix jun08
+            nint(qmax_int*State%curvature_radius)-3)
         call Init_ClTransfer(ThisCT)
-        call ThisCT%q%Getdpoints(half_ends = .false.) !Jun08
+        call ThisCT%q%Getdpoints(half_ends = .false.)
     else
+        !Accurate-reionization polarization needs denser CMB integration sampling at low q (reionization bump
+        !is at low l). Only the log block (lognum) and the first linear block step (dk0) are scaled here.
+        LowQIntBoost = IntSampleBoost
+        if (AccuracyTarget > 0 .and. CP%Want_CMB .and. CP%WantScalars .and. CP%Accuracy%AccuratePolarization &
+            .and. CP%Accuracy%AccurateReionization) then
+            LowQIntBoost = LowQIntBoost*1.8_dl
+            if (State%closed) then
+                LowQCurvBoost = min(1._dl, abs(State%curv_flat_DM_ratio - 1._dl)/0.01_dl)
+                LowQIntBoost = LowQIntBoost*(1._dl + 0.4_dl*LowQCurvBoost)
+            end if
+        end if
         !Split up into logarithmically spaced intervals from qmin up to k=lognum*dk0
         !then no-lognum*dk0 linearly spaced at dk0 up to no*dk0
         !then at dk up to max_k_dk, then dk2 up to qmax_int
-        lognum=nint(10*IntSampleBoost)
+        lognum=nint(10*LowQIntBoost)
         dlnk1=1._dl/lognum
         no=nint(600*IntSampleBoost)
-        dk0=1.8_dl/State%curvature_radius/(State%DMt0/State%curvature_radius)/IntSampleBoost
-        dk=3._dl/State%curvature_radius/(State%DMt0/State%curvature_radius)/IntSampleBoost/1.6
+        dk0=1.8_dl/State%DMt0/LowQIntBoost
+        dk=3._dl/State%DMt0/IntSampleBoost/1.6
 
         k_max_log = lognum*dk0
         k_max_0  = no*dk0
@@ -1305,7 +1344,8 @@
 
         if (State%closed) then
             call SetClosedkValuesFromArr(ThisCT%q,.true.)
-            call ThisCT%q%Getdpoints(half_ends = .false.)
+            ! half end at top for consistency with flat if tail not converged
+            call ThisCT%q%Getdpoints(half_ends = .true.)
             ThisCT%q%dpoints(1) = 1/State%curvature_radius
             deallocate(ThisCT%Delta_p_l_k) !Re-do this from Init_ClTransfer because number of points changed
             allocate(ThisCT%Delta_p_l_k(ThisCT%NumSources, &
@@ -1320,80 +1360,134 @@
 
     subroutine InterpolateSources(IV)
     implicit none
-    integer i,khi,klo, step
-    real(dl) xf,b0,ho,a0,ho2o6,a03,b03
-    type(IntegrationVars) IV
-    Type(TRanges), pointer :: Evolve_q
+
+    type(IntegrationVars), intent(inout) :: IV
+
+    integer :: i, j
+    integer :: klo, khi, lo, hi, mid
+    integer :: ntime, nsrc, npoints
+    integer :: step
+
+    real(dl) :: q, tau, qtau, xf
+    real(dl) :: ho, ho2o6
+    real(dl) :: a0, b0, a03, b03
+    real(dl) :: max_etak
+    real(dl), parameter :: eps_xf = 1.e-8_dl
+
+    logical :: ignore_etak
+
+    type(TRanges), pointer :: Evolve_q
 
     Evolve_q => ThisSources%Evolve_q
 
-    !     finding position of k in table Evolve_q to do the interpolation.
+    q       = IV%q
+    ntime   = State%TimeSteps%npoints
+    npoints = Evolve_q%npoints
+    nsrc    = size(IV%Source_q, 2)
 
-    !Can't use the following in closed case because regions are not set up (only points)
-    !           klo = min(Evolve_q%npoints-1,Evolve_q%IndexOf(IV%q))
-    !This is a bit inefficient, but thread safe
-    klo=1
-    do while ((IV%q > Evolve_q%points(klo+1)).and.(klo < (Evolve_q%npoints-1)))
-        klo=klo+1
-    end do
-
-    khi=klo+1
-
-
-    ho=Evolve_q%points(khi)-Evolve_q%points(klo)
-    a0=(Evolve_q%points(khi)-IV%q)/ho
-    b0=(IV%q-Evolve_q%points(klo))/ho
-    ho2o6 = ho**2/6
-    a03=(a0**3-a0)
-    b03=(b0**3-b0)
-    IV%SourceSteps = 0
-
-    !     Interpolating the source as a function of time for the present
-    !     wavelength.
-    step=2
-    do i=2, State%TimeSteps%npoints
-        xf=IV%q*(State%tau0-State%TimeSteps%points(i))
-        if (CP%WantTensors) then
-            if (IV%q*State%TimeSteps%points(i) < max_etak_tensor.and. xf > 1.e-8_dl) then
-                step=i
-                IV%Source_q(i,:) =a0*scaledSrc(klo,:,i)+&
-                    b0*scaledSrc(khi,:,i)+(a03 *ddScaledSrc(klo,:,i)+ &
-                    b03*ddScaledSrc(khi,:,i)) *ho2o6
-            else
-                IV%Source_q(i,:) = 0
-            end if
-        end if
-        if (CP%WantVectors) then
-            if (IV%q*State%TimeSteps%points(i) < max_etak_vector.and. xf > 1.e-8_dl) then
-                step=i
-                IV%Source_q(i,:) =a0*ScaledSrc(klo,:,i) + b0*ScaledSrc(khi,:,i)+(a03 *ddScaledSrc(klo,:,i)+ &
-                    b03*ddScaledSrc(khi,:,i)) *ho2o6
-            else
-                IV%Source_q(i,:) = 0
-            end if
-        end if
-
-        if (CP%WantScalars) then
-            if ((DebugEvolution .or. WantLateTime .or. IV%q*State%TimeSteps%points(i) < max_etak_scalar) &
-                .and. xf > 1.e-8_dl) then
-                step=i
-                IV%Source_q(i,:) = a0 * ScaledSrc(klo,:,i) +  b0 * ScaledSrc(khi,:,i) + (a03*ddScaledSrc(klo,:,i) + &
-                    b03 * ddScaledSrc(khi,:,i)) * ho2o6
-            else
-                IV%Source_q(i,:) = 0
-            end if
-        end if
-    end do
+    ! Preserve original default behaviour: step starts at 2.
+    step = 2
     IV%SourceSteps = step
 
-    if (.not.State%flat) then
-        do i=1, ThisSources%SourceNum
-            call spline_def(State%TimeSteps%points,IV%Source_q(:,i),State%TimeSteps%npoints,&
-                IV%ddSource_q(:,i))
-        end do
+    ! Zero all rows that this routine is responsible for.
+    if (ntime >= 2) then
+        IV%Source_q(2:ntime, :) = 0._dl
+    else
+        return
     end if
 
-    end subroutine
+    ! Determine active source type.
+    ! This preserves the original overwrite order:
+    ! tensors first, then vectors, then scalars.
+    ignore_etak = .false.
+    max_etak = 0._dl
+
+    if (CP%WantScalars) then
+        if (DebugEvolution .or. WantLateTime) then
+            ignore_etak = .true.
+        else
+            max_etak = max_etak_scalar
+        end if
+    else if (CP%WantTensors) then
+        max_etak = max_etak_tensor
+    else if (CP%WantVectors) then
+        max_etak = max_etak_vector
+    end if
+
+    ! ------------------------------------------------------------------
+    ! Thread-safe binary search for interpolation interval.
+    ! Assumes Evolve_q%points is monotonically increasing.
+    ! Clamp outside range to the nearest interval, matching typical
+    ! interpolation-table behaviour.
+    ! ------------------------------------------------------------------
+    if (q <= Evolve_q%points(1)) then
+        klo = 1
+    else if (q >= Evolve_q%points(npoints)) then
+        klo = npoints - 1
+    else
+        lo = 1
+        hi = npoints
+
+        do while (hi - lo > 1)
+            mid = (lo + hi) / 2
+
+            if (q >= Evolve_q%points(mid)) then
+                lo = mid
+            else
+                hi = mid
+            end if
+        end do
+
+        klo = lo
+    end if
+
+    khi = klo + 1
+
+    ho = Evolve_q%points(khi) - Evolve_q%points(klo)
+
+    if (ho == 0._dl) then
+        error stop 'InterpolateSources: duplicate Evolve_q points give zero interval'
+    end if
+
+    a0 = (Evolve_q%points(khi) - q) / ho
+    b0 = (q - Evolve_q%points(klo)) / ho
+
+    ho2o6 = ho * ho / 6._dl
+
+    a03 = a0 * a0 * a0 - a0
+    b03 = b0 * b0 * b0 - b0
+
+    ! ------------------------------------------------------------------
+    ! Interpolate source as a function of time for current q.
+    !
+    ! Because IV%Source_q(2:ntime,:) was already zeroed, only valid
+    ! source rows need to be filled.
+    !
+    ! If State%TimeSteps%points is monotonically increasing, once the
+    ! condition fails it will keep failing, so we can exit early.
+    ! ------------------------------------------------------------------
+    do i = 2, ntime
+        tau  = State%TimeSteps%points(i)
+        qtau = q * tau
+        xf   = q * (State%tau0 - tau)
+
+        if ((ignore_etak .or. qtau < max_etak) .and. xf > eps_xf) then
+            step = i
+
+            do j = 1, nsrc
+                IV%Source_q(i, j) = a0 * ScaledSrc(klo, j, i) + &
+                    b0 * ScaledSrc(khi, j, i) + &
+                    (a03 * ddScaledSrc(klo, j, i) + &
+                    b03 * ddScaledSrc(khi, j, i)) * ho2o6
+            end do
+        else
+            exit
+        end if
+    end do
+
+    IV%SourceSteps = step
+
+    end subroutine InterpolateSources
 
 
     subroutine IntegrationVars_Init(IV)
@@ -1403,18 +1497,25 @@
     IV%Source_q(State%TimeSteps%npoints,:) = 0
     IV%Source_q(State%TimeSteps%npoints-1,:) = 0
 
-    end  subroutine IntegrationVars_Init
+    end subroutine IntegrationVars_Init
 
 
     subroutine DoSourceIntegration(IV, ThisCT) !for particular wave number q
     type(IntegrationVars) IV
     Type(ClTransferData) :: ThisCT
-    integer j,ll,llmax
-    real(dl) nu
+    integer j,ll,llmax,n
+    real(dl) nu, chi_full_max, chi_here, sh
+    real(dl) :: near_flat_boost
     real(dl) :: sixpibynu
+    real(dl) :: near_flat_time_weight(IV%SourceSteps)
+    logical :: use_near_flat_gate, use_shifted_nu_near_flat
+    logical :: have_near_flat_time_weight
 
     nu=IV%q*State%curvature_radius
     sixpibynu  = 6._dl*const_pi/nu
+    chi_full_max = (State%tau0 - State%TimeSteps%points(2)) / State%curvature_radius
+    near_flat_boost = NearFlatIntegrationBoost()
+    have_near_flat_time_weight = .false.
 
     if (State%closed) then
         if (nu<20 .or. State%tau0/State%curvature_radius+sixpibynu > const_pi/2) then
@@ -1424,7 +1525,7 @@
             llmax=min(llmax,nint(nu)-1)  !nu >= l+1
         end if
     else
-        llmax=nint(nu*(State%DMt0/State%curvature_radius))
+        llmax=nint(IV%q*State%DMt0)
         if (llmax<15) then
             llmax=17 !AL Sept2010 changed from 15 to get l=16 smooth
         else
@@ -1438,7 +1539,42 @@
         do j=1,ThisCT%ls%nl
             ll=ThisCT%ls%l(j)
             if (ll>llmax) exit
-            call IntegrateSourcesBessels(IV,ThisCT,j,ll,nu)
+            if (enable_olver_source_integration .and. CP%WantScalars .and. ThisSources%SourceNum <= 3) then
+                call DoCurvedOlverIntegration(IV, ThisCT, j, ll, nu)
+                cycle
+            end if
+            use_shifted_nu_near_flat = .false.
+            use_near_flat_gate = CP%WantScalars .and. ThisSources%SourceNum <= 3 .and. &
+                enable_do_near_flat_integration .and. &
+                UseNearFlatSmallChiApprox(ll, nu, chi_full_max, near_flat_boost)
+            if (use_near_flat_gate) then
+                use_shifted_nu_near_flat = enable_shifted_nu_scalar_approx .and. &
+                    UseShiftedNuNearFlatIntegration(ll, nu, chi_full_max, near_flat_boost)
+                use_near_flat_gate = use_shifted_nu_near_flat .or. enable_near_flat_smallchi_integration
+            end if
+
+            if (use_near_flat_gate) then
+                if (.not. have_near_flat_time_weight) then
+                    do n = 1, IV%SourceSteps
+                        chi_here = (State%tau0 - State%TimeSteps%points(n)) / State%curvature_radius
+                        if (abs(chi_here) < 1.e-8_dl) then
+                            near_flat_time_weight(n) = State%TimeSteps%dpoints(n)
+                        else
+                            sh = State%rofChi(chi_here)
+                            near_flat_time_weight(n) = State%TimeSteps%dpoints(n) * chi_here / sh
+                        end if
+                    end do
+                    have_near_flat_time_weight = .true.
+                end if
+
+                if (use_shifted_nu_near_flat) then
+                    call DoNearFlatIntegration(IV, ThisCT, j, ll, nu, near_flat_time_weight)
+                else
+                    call DoNearFlatSmallChiIntegration(IV, ThisCT, j, ll, nu, near_flat_time_weight)
+                end if
+            else
+                call IntegrateSourcesBessels(IV,ThisCT,j,ll,nu)
+            end if
         end do !j loop
     end if
 
