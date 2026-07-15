@@ -22,9 +22,9 @@ When the container is created it:
 - installs the CAMB build toolchain, including `gfortran`, `g++`, `make`, and `libgsl-dev`
 - installs `uv` for locked, repeatable Python environment syncs
 - creates the container-local Python virtual environment and pre-installs the small Python dependency/tool set
-- downloads CosmoRec into `external/CosmoRec`
+- clones the [cmbant/CosmoRec](https://github.com/cmbant/CosmoRec) fork into `external/CosmoRec`, which compiles and
+  links against CAMB's Python wrapper without any patching
 - clones HYREC-2 into `external/HYREC-2`
-- patches the CosmoRec makefile to add `-fPIC`, which CAMB's Python wrapper requires
 - rebuilds `camb` with `recfast`, `cosmorec`, and `hyrec` enabled, and adds the workspace to the environment with a `.pth` file, but leaves recfast default for new builds.
 - configures `core.hooksPath` to use the tracked `.githooks/pre-commit` wrapper, which can use `pre-commit` from the container venv or from a host `.venv`
 - pre-installs the `pre-commit` hook environments into a container-local cache so later hook runs can work offline

@@ -155,10 +155,8 @@ class Recfast(RecombinationModel):
 class CosmoRec(RecombinationModel):
     """
     `CosmoRec <https://www.jb.man.ac.uk/~jchluba/Science/CosmoRec/CosmoRec.html>`_ recombination model.
-    To use this, the library must be built with CosmoRec installed and RECOMBINATION_FILES including cosmorec
-    in the Makefile.
-
-    CosmoRec must be built with -fPIC added to the compiler flags.
+    To use this, CAMB must be built with CosmoRec installed from `GitHub <https://github.com/cmbant/CosmoRec>`_
+    and RECOMBINATION_FILES set to include cosmorec in the CAMB Makefile.
 
     """
 

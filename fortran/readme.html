@@ -192,7 +192,7 @@
                   <H3>Compilation options and code modifications</H3>
                   <P>
                     The Makefile should work out of the box in most cases for ifort and gfortran.
-                    If you define your own new classes, or want to compile with <A HREF="http://www.jb.man.ac.uk/~jchluba/Science/CosmoRec/CosmoRec.html">CosmoRec</A> or <A HREF="https://github.com/nanoomlee/HYREC-2">HyRec</A> recombination support, you can edit the file list variables at the top of Makefile_main.
+                    If you define your own new classes, or want to compile with <A HREF="https://github.com/cmbant/CosmoRec">CosmoRec</A> or <A HREF="https://github.com/nanoomlee/HYREC-2">HyRec</A> recombination support, you can edit the file list variables at the top of Makefile_main.
                     You can also use e.g. <B>make RECOMBINATION_FILES="recfast cosmorec"</b> to override the default and compile with additional files.
                     REIONIZATION is by default a simple relatively fast single-step reionization model (following <A HREF="http://arxiv.org/abs/0804.3865">arXiv:0804.3865</A>), but you could add alternative models by implementing other derived classes.
                   </P>
@@ -311,7 +311,7 @@
                               by Douglas Scott (with minor modifications for CMBFAST and the
                               CAMB). See <A
                                  HREF="http://www.astro.ubc.ca/people/scott/recfast.html">RECFAST</A>
-                              for the original code. This module implements the TRecombinationModel class required by CAMB. Sample wrappers are also provided for <A HREF="http://www.jb.man.ac.uk/~jchluba/Science/CosmoRec/CosmoRec.html">CosmoRec</A> and <A HREF="https://github.com/nanoomlee/HYREC-2">HyRec</A>, but the libraries for these must be installed separately.
+                              for the original code. This module implements the TRecombinationModel class required by CAMB. Sample wrappers are also provided for <A HREF="https://github.com/cmbant/CosmoRec">CosmoRec</A> and <A HREF="https://github.com/nanoomlee/HYREC-2">HyRec</A>, but the libraries for these must be installed separately.
                             <P>
                               <B>SeparableBispectrum.f90</B>
                             <P>

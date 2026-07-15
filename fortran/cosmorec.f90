@@ -2,11 +2,12 @@
     ! Recombination module for CAMB, using CosmoRec
     ! Author: Richard Shaw (CITA)
     !
-    ! To use with the python wrapper add -fPIC to CCFLAGS in the CosmoRec Makefile (for gcc)
+    ! Link CosmoRec installed from https://github.com/cmbant/CosmoRec
     !---------------------------------------------------------------------------------------------------
     ! 08.06.2012: added possibility to communicate Hubble (Jens Chluba)
     ! 12.06.2012: AL, changed interface to pass nnu directly; fixed spline extrapolation
     ! 09.01.2019: AL, updated for new class structure
+    ! 15.07.2026: AL, updated to use https://github.com/cmbant/CosmoRec and more accurate defaults
 
     module CosmoRec
     use precision
