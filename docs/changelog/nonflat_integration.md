@@ -17,13 +17,20 @@ This note summarizes the current non-flat integration changes in `fortran/cmbmai
   `u_{\nu l}(\chi) \approx (\chi / S_K(\chi)) j_l(\nu_{\mathrm{eff}} \chi)` with
   `\nu_{\mathrm{eff}}^2 = \nu^2 - K_{\mathrm{sign}} l(l+1) / 3`.
 - When the full scalar source range is inside that near-flat regime, `IntegrateSourcesBessels` now bypasses the dissipative/oscillatory split entirely and uses a dedicated `DoNearFlatIntegration` path that follows the same source-grid traversal order and the same high-`x` and Limber cutoffs as `DoFlatIntegration`, after replacing `q` by the shifted `\nu_{\mathrm{eff}} / R_K` and including the extra `\chi / S_K(\chi)` factor.
-- This branch is only used when the shared near-flat runtime criteria are active in both `results.f90` and `cmbmain.f90`:
-  `|State%scale - 1| <= 0.03`, `chi_max < near_flat_approx_chi_limit / sqrt(AccuracyBoost * NonFlatIntAccuracyBoost)`,
-  `chiDisp < near_flat_approx_chidisp_limit`, and the shared local error estimate
-  `l(l+1) chi_max^2 / (15 \nu_{\mathrm{eff}}^2) < 1.0e-3 / (AccuracyBoost * NonFlatIntAccuracyBoost)`.
+- This branch is only used when the shared near-flat runtime criteria are active in both `results.f90` and `cmbmain.f90`. The static `near_flat_approx_chi_limit`/`near_flat_approx_chidisp_limit` parameters described in earlier drafts no longer exist; the current gates in `cmbmain.f90` are two boolean functions of `(l, nu, chi_max, boost_scale)`, with `boost_scale = NearFlatIntegrationBoost() = max(NonFlatIntAccuracyBoost * AccuracyBoost, 1)`:
+  - `UseNearFlatSmallChiApprox` first requires `State%scale >= 1 - near_flat_scale_tol`, then gates on
+    `alpha_gate = nu/l` and `smallchi_metric = l^2 chi_max^7 / nu`:
+    `(alpha_gate > 2.5 .or. (l >= 50 .and. alpha_gate > 1)) .and. smallchi_metric < 0.1 / boost_scale`.
+  - `UseShiftedNuNearFlatIntegration` (only reached once the above gate is true) uses the phase/amplitude
+    error estimate `err_shift = 0.5*arg_err + amp_err` built from `alpha = nu/l`, `tmax = alpha*chi_max`,
+    `arg_err = l*tmax^3/(90*alpha^4)`, `amp_err = tmax^2/(180*alpha^4)`, and requires
+    `err_shift < NEARFLAT_TOL / boost_scale` with `NEARFLAT_TOL = 1e-3`.
+  - When the small-chi gate is true but the shifted-ν gate is not (and `enable_near_flat_smallchi_integration`
+    is set), a third path, `DoNearFlatSmallChiIntegration`, is used instead of `DoNearFlatIntegration` -
+    it stays on the true `nu`/`q` rather than switching to `\nu_{\mathrm{eff}}`.
 - The near-flat scalar approximations are also guarded by the runtime switches `enable_do_near_flat_integration` and `enable_shifted_nu_scalar_approx`, which let the full-path and local shifted-ν branches be compared without rebuilding.
 - In the same regime, `lSamples_init` keeps `Ascale = 1 / lSampleBoost` so the `l` sampling stays on the flat template, and the flat Bessel spline tables are initialized for the non-flat scalar integration as well.
-- The flat Bessel precomputation now accepts the requested `k eta` range directly, and the near-flat non-flat caller uses a fixed analytic extra margin so all models that use the shifted-ν approximation with the same `lmax` and `max_eta_k` request the same cached table extent. The bound uses only `near_flat_scale_tol`, `near_flat_approx_chi_limit`, `lmax`, and `max_eta_k`; for `lmax = 4000`, `lens_potential_accuracy = 4`, and `max_eta_k = 72000`, this requests `x_max = 74249` for every approximation-eligible model. In the tested cases, this safely covers the observed worst shifted-ν range, which was about `72243.6` for `Omega_k = -0.002`.
+- The flat Bessel precomputation now accepts the requested `k eta` range directly, and the near-flat non-flat caller uses a fixed analytic extra margin so all models that use the shifted-ν approximation with the same `lmax` and `max_eta_k` request the same cached table extent. The bound is computed by `ShiftedNuBesselTableMaxEtak(lmax, base_etak)`, combining a conservative `chi_max` (the larger of a model-independent bound derived from `near_flat_scale_tol` and the run's actual `tau0/curvature_radius`), a rescaled `base_etak / (1 - near_flat_scale_tol)`, and the curvature contribution `chi_max * sqrt(l(l+1)/3)` in quadrature (`hypot`), plus a fixed `safety_margin = 10`; for `lmax = 4000`, `lens_potential_accuracy = 4`, and `max_eta_k = 72000`, this requests `x_max = 74249` for every approximation-eligible model. In the tested cases, this safely covers the observed worst shifted-ν range, which was about `72243.6` for `Omega_k = -0.002`.
 
 ## Code simplifications
 

@@ -36,11 +36,12 @@ It is initialized to `1` while the background distances are being built, then
 updated after `z_drag` and the sound horizon are known.
 
 This ratio is used to decide whether the existing flat-model `l` sampling and
-flat spherical-Bessel table machinery can be reused. If
-`abs(State%scale - 1) <= near_flat_scale_tol` with
-`near_flat_scale_tol = 0.03`, equivalently \(|s_{\rm peak}-1|\le0.03\), CAMB
+flat spherical-Bessel table machinery can be reused. The actual guards in
+`cmbmain.f90`/`results.f90` are one-sided on `State%scale >= 1 - near_flat_scale_tol`
+with `near_flat_scale_tol = 0.03` (there is no corresponding upper-side check for
+`State%scale` far above `1`); when this holds, CAMB
 treats the peak shift as small enough to keep
 the near-flat table strategy, enlarging the tabulated Bessel argument range when
-needed for shifted-`q` calls. If the ratio is outside this tolerance, the
+needed for shifted-`q` calls. If `State%scale < 1 - near_flat_scale_tol`, the
 acoustic scale has moved enough that the `l` sampling is scaled by
 `State%scale` instead of assuming the fiducial flat sampling.

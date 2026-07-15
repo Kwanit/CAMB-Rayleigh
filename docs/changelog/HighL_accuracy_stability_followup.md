@@ -63,6 +63,15 @@ two `AccuracyTarget` cases are folded into one branch and the redundant
 `Want_CMB_lensing .and. WantScalars` checks are dropped because the routine is reached only for
 lensed scalar CMB.
 
+**Current code** (`fortran/lensing.f90`, shared block in `lensClsWithSpectrum`/method-4 path): only
+`ThetaSampleBoost` keeps an `AccuracyTarget > 0` multiplier, and it is a smooth ramp rather than a
+step at `Max_l = 3500`: `ThetaSampleBoost = LensAccuracyBoost * (1.6 + 0.6*high_l_ramp)`, where
+`high_l_ramp` is a smoothstep in `output_lmax = CP%Max_l - CP%lens_output_margin` between `2500` and
+`3500` (`0` below `2500`, `1` at/above `3500`). That gives exactly the base `1.6` and high-`l`
+cushion `2.2` described later in this section. `LensRangeBoost` no longer has any separate
+`AccuracyTarget`/high-`l` floor at all - it is simply `LensAccuracyBoost`
+(`= AccuracyBoost*LensingBoost`) in the current code.
+
 `range_fac` (which gates `npoints`) and `interp_fac` use `LensRangeBoost`, so they no longer scale
 with `LensAccuracyBoost` directly.
 
@@ -180,6 +189,15 @@ changing the BAO-region step. Instead, the existing `if (highPrecisionTransferSo
 divides `dkn1` and `dkn2` by 1.5 is tightened to 2.25, scoping the fix to exactly the linear
 sections that matter for the BAO-scale matter-power stability.
 
+**Superseded:** `InitTransfer` (`fortran/cmbmain.f90`) no longer references `CP%NonLinear` at all.
+The `nonlinear .and. high_precision` and `nonlinear .and. kmax > 20` floors described above, and the
+`dkn1`/`dkn2` tightening to 2.25 for `highPrecisionTransferSources`, are not present in the current
+code; only the plain `if (CP%Transfer%high_precision) boost = boost*1.5` multiplier remains. The
+HMcode low-`k` matter-power case that motivated the `dlog_highk` floor here was instead fixed via the
+massless-neutrino/photon hierarchy retuning in
+[matter_power_transfer_accuracy_review.md](matter_power_transfer_accuracy_review.md), which is the
+current behavior.
+
 ## Photon and neutrino hierarchy lengths
 
 The previous patch added a `lowqPhotonBoost` to `EV%lmaxg` at `EV%q < 0.05`, gated on
@@ -202,6 +220,13 @@ The elseif fires for `params_HMcode.ini` only (kmax = 100, `high_precision = F`)
 `high_precision = F`-specific path. Removing the elseif under the relaxed `3e-3` matter-power
 tolerance still fails (matter P `0.00388` at `k/h = 100`), so the elseif is needed even when
 `transfer_high_precision = F`.
+
+**Superseded:** the flat `EV%lmaxnr = 35` elseif (gated on `EV%q > 0.05`) described above is no
+longer in `fortran/equations.f90`. It was replaced by the monotone `transfer_high_precision .or.
+CP%Do21cm` ramp documented in
+[matter_power_transfer_accuracy_review.md](matter_power_transfer_accuracy_review.md#hierarchy-tuning)
+(`8*lAccuracyBoost` at `q=0.010` rising to `45*lAccuracyBoost` at `q=0.12`), which is the current
+behavior and also removes the `q=0.12` discontinuity noted there.
 
 Late photon-multipole truncation gets a single-line `latePhotSwitchBoost = max(switchBoost, 2)`
 when `AccuracyTarget > 0 .and. WantTransfer .and. high_precision` (refactored from the prior

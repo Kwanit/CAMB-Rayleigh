@@ -1,5 +1,12 @@
 # Planck 2018 Accuracy Stability
 
+> **Note:** [`HighL_accuracy_stability_followup.md`](HighL_accuracy_stability_followup.md)
+> narrows several of the floors introduced here, and some (the `dkn1`/`dkn2`
+> high-precision-transfer refinement, the flat `ThetaSampleBoost`/`LensRangeBoost`
+> floors, and the `lmaxnr = 35` gate) were later replaced entirely and are no
+> longer present in the current code - see the "Superseded"/"Current code" notes
+> added to the followup doc for what actually ships today.
+
 ## Summary
 
 This investigation targeted

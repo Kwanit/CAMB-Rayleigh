@@ -71,7 +71,11 @@ $(dS_K/d\chi|_{\chi_t})^{-1/6}$.
 
 ## Fast Implementation Details
 
-The production implementation is in `fortran/hyperspherical_bessels_olver.f90`.
+The production `phi_olver`/`u_olver` implementation is in
+`fortran/hyperspherical_bessels_olver.f90`. `qintegral_exact` (the curved action)
+and `invert_flat_action` live in the shared `HypersphericalBesselUtils` module in
+`fortran/hyperspherical_bessels_airy.f90`, and are `use`-imported by the Olver
+module.
 
 - `qintegral_exact` evaluates the curved action analytically for open and
   closed models. The inverse trigonometric branches use `atan2` forms to avoid
@@ -87,13 +91,19 @@ The production implementation is in `fortran/hyperspherical_bessels_olver.f90`.
   $z-z_t\simeq (dS_K/d\chi|_{\chi_t})^{1/3}(\chi-\chi_t)$, with the matching
   amplitude limit. This avoids cancellation in the closed-form action before
   the universal inverse-action approximation is used.
-- `phi_olver`, `phi_olver_raw`, and `u_olver` share the same internal reduced
-  evaluation path. `u_olver` returns $u_\ell=S_K\phi_\ell$ directly for callers
-  that do not need the final trigonometric division.
-- The production `phi_olver` path may use the small-$\chi$ map as a fast local
-  approximation when its pointwise gate is satisfied. The diagnostic
-  `phi_olver_raw` path always uses the full action map, except for the exact
-  flat and low-$\ell$ stable-reference paths.
+- `phi_olver` and `u_olver` are the only two public entry points into the
+  shared internal reduced evaluation path (`olver_value`/`olver_reduced` in
+  `hyperspherical_bessels_olver.f90`); there is no separately exported
+  `phi_olver_raw`. Internally, `olver_reduced` takes a `raw` flag that would
+  select the full action map with no small-$\chi$/recursive/Airy fallback,
+  but both `phi_olver` and `u_olver` currently call it with `raw=.false.`,
+  and no caller in the current code passes `raw=.true.` - the raw path exists
+  in the source but is not currently reachable/exercised. `u_olver` returns
+  $u_\ell=S_K\phi_\ell$ directly for callers that do not need the final
+  trigonometric division.
+- The production `phi_olver` path may use the small-$\chi$ map
+  (`phi_olver_smallchi`, also public) as a fast local approximation when its
+  pointwise gate is satisfied.
 
 ## Small-Chi Approximation
 
@@ -189,18 +199,22 @@ $$
 
 ## Accuracy Checks
 
-The main harnesses are:
-
-- `fortran/tests/olver_phi_compare.f90`
-- `accuracy_plots/olver_hyperspherical/compare_smallchi_olver.py`
-- `accuracy_plots/olver_hyperspherical/scan_olver_chi_bins.py`
-- `accuracy_plots/olver_hyperspherical/phi_qapprox_peaknorm_cases.f90`
+**Note:** the harness paths and `phi_langer` comparisons below were produced with
+exploratory scripts and a WKB/Langer reference implementation that are no longer
+present in the tree (none of `fortran/tests/olver_phi_compare.f90`,
+`accuracy_plots/olver_hyperspherical/*`, or a `phi_langer` function exist in the
+current codebase). The numbers are kept here as a historical record of the
+calibration that produced the current gate constants in
+`fortran/hyperspherical_bessels_olver.f90`. The currently committed regression
+harness is `fortran/tests/phi_olver_gate_validation.f90`, which validates
+`phi_olver` directly against `phi_recurs` (peak-normalized error target
+`2e-4`) without a separate `phi_langer` comparison.
 
 ### Full Olver Tests
 
-The current broad validation grid compares `phi_olver`, diagnostic
+The (no-longer-present) broad validation grid compared `phi_olver`, diagnostic
 `phi_olver_raw`, `phi_olver_smallchi`, and `phi_langer` against
-`phi_recurs`. It uses open/flat/closed cases, every integer
+`phi_recurs`. It used open/flat/closed cases, every integer
 $1\le\ell\le20$, representative larger multipoles up to $\ell=6000$, alpha
 targets from near the curvature scale to $2\times10^4$, and
 $\chi_{\max}=0.01,0.1,0.3,0.5,1.0,1.57,2.0$. Closed modes are rounded to

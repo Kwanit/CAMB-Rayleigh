@@ -79,8 +79,8 @@ covers the L range they actually care about.
 
 The lensed output upper limit lives in `CLout%lmax_lensed` and is
 computed identically by all lensing methods. From
-[`fortran/lensing.f90`](../fortran/lensing.f90) (lines ~251–256 for
-method 1, ~739–743 for method 4):
+[`fortran/lensing.f90`](../fortran/lensing.f90), shared by all lensing
+methods in `InitLensedClArrays` (around line 232):
 
 ```fortran
 max_lensed_ix = lSamp%nl-1

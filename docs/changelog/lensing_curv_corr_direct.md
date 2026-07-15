@@ -3,13 +3,16 @@
 ## Summary
 
 This change adds a new Fortran lensing option,
-`lensing_method_curv_corr_direct = 4`, which evaluates the curved-sky correlation
+`lensing_method_curv_corr_full = 4`, which evaluates the curved-sky correlation
 integrals directly with Gauss-Legendre quadrature in the same overall style as
 `camb.correlations.lensed_cls`.
 
 It also adds `lensing_method_optimized = 5`, which uses the old curved-sky
 method when `AccurateBB = False` and the direct Gauss-Legendre implementation
-when `AccurateBB = True`.
+when `AccurateBB = True`. `lensing_method_optimized` is now the default
+`lensing_method` in `fortran/lensing.f90` (`integer :: lensing_method =
+lensing_method_optimized`), so the direct method-4 path is exercised by
+default for `AccurateBB = True` runs.
 
 The main implementation work was:
 
@@ -39,7 +42,7 @@ Method 1, `lensing_method_curv_corr`, is the existing curved-sky correlation
 function implementation. It uses the non-perturbative isotropic term together
 with a second-order expansion in `C_gl,2`.
 
-Method 4, `lensing_method_curv_corr_direct`, evaluates the correlation function
+Method 4, `lensing_method_curv_corr_full`, evaluates the correlation function
 more directly with Gauss-Legendre sampling over angle and explicit accumulation
 of the curved-sky Wigner-d combinations. The Fortran implementation was written
 to follow the structure of `camb.correlations.lensed_cls`, but there are still a
@@ -87,9 +90,10 @@ comparison used here is:
 This removes the extra-physics mismatch and leaves only the difference between
 the numerical lensing algorithms on the same inputs.
 
-The exact benchmark used for the numbers below is left in the working tree as
-`scripts/benchmark_lensing_custom.py`. The final tables below were produced with
-its `--strict-reference` mode.
+The exact benchmark script used for the numbers below was a scratch script not
+committed to the repository (`scripts/benchmark_lensing_custom.py` does not
+exist in the current tree); the tables below are kept as a historical record of
+its `--strict-reference` mode output.
 
 ## Accuracy Results: Strict Matched Support, AccurateBB = True
 
