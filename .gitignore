@@ -96,10 +96,6 @@ lensing_cgrads.f90
 !inifiles/planck_2018_acc.ini
 !inifiles/sources_defaults.ini
 prompts.txt
-
-scripts
-!.agents/skills/**/scripts/
-!.agents/skills/*/scripts/*.py
 uv.lock
 .venv
 __pycache__
