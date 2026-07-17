@@ -105,6 +105,7 @@
     procedure :: Version => TRecombinationModel_version
     procedure :: dDeltaxe_dtau => TRecombinationModel_dDeltaxe_dtau
     procedure :: get_Saha_z => TRecombinationModel_Get_Saha_z
+    procedure :: Recombination_rayleigh_eff => TRecombinationModel_Recombination_rayleigh_eff ! added for Rayleigh scattering
     end type
 
     Type, extends(TCambComponent) :: TReionizationModel
@@ -257,6 +258,25 @@
     TRecombinationModel_xe=0
 
     end function TRecombinationModel_xe
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## base-class stub: only TRecfast implements this (RECFAST-
+    !########## only is fine for now); any other recombination backend
+    !########## used together with Rayleigh scattering hits this MpiStop
+    !##################################################################
+    function TRecombinationModel_Recombination_rayleigh_eff(this,a)
+    class(TRecombinationModel) :: this
+    real(dl), intent(in) :: a
+    real(dl) TRecombinationModel_Recombination_rayleigh_eff
+
+    call MpiStop('TRecombinationModel_Recombination_rayleigh_eff not implemented')
+    TRecombinationModel_Recombination_rayleigh_eff=0
+
+    end function TRecombinationModel_Recombination_rayleigh_eff
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
 
     subroutine TRecombinationModel_xe_Tm(this,a, xe, Tm)
     !Not required to implement, but may be able to optimize

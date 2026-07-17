@@ -33,6 +33,7 @@
     use config
     use model
     use Interpolation
+    use SourceWindows, only : Rayleigh_NumFreq, Rayleigh_OpacityFactor ! added for Rayleigh scattering
     !$ use omp_lib, only: omp_get_max_threads
     implicit none
     public
@@ -74,10 +75,27 @@
         logical :: HasThermoData = .false. !Has it been computed yet for current parameters?
         !Background thermal history, interpolated from precomputed tables
         integer :: nthermo !Number of table steps
-        !baryon temperature, sound speed, ionization fractions, and opacity
-        real(dl), dimension(:), allocatable :: tb, cs2, xe, dotmu
+        !baryon temperature, sound speed, ionization fractions
+        real(dl), dimension(:), allocatable :: tb, cs2, xe
+        !##################################################################
+        !######### feature added for Rayleigh scattering #############
+        !########## dotmu/ddotmu/dddotmu/ddddotmu/emmu/demmu carry a
+        !########## trailing frequency axis: column 1 is the primary
+        !########## (Thomson-only) channel, computed exactly as before;
+        !########## columns 2..nscatter are the Rayleigh channels. This
+        !########## generalizes the existing type-bound machinery in
+        !########## place rather than bolting on a separate table.
+        !########## num_cmb_freq is cached here (set once per Thermo_Init
+        !########## call from the one source of truth, Rayleigh_NumFreq)
+        !########## since TThermoData itself has no CP/SourceTerms access.
+        !##################################################################
+        integer :: num_cmb_freq = 0
+        real(dl), dimension(:,:), allocatable :: dotmu
         ! e^(-tau) and derivatives
-        real(dl), dimension(:), allocatable :: emmu, demmu, ddotmu, dddotmu, ddddotmu
+        real(dl), dimension(:,:), allocatable :: emmu, demmu, ddotmu, dddotmu, ddddotmu
+        !###################################################################
+        !################ end of feature ########################
+        !###################################################################
         real(dl), dimension(:), allocatable :: ScaleFactor, adot, dadot
         real(dl), dimension(:), allocatable :: winlens, dwinlens
         Type(TThermoHorner), dimension(:), allocatable :: thermo_horner
@@ -102,6 +120,7 @@
     procedure :: values => Thermo_values
     procedure :: expansion_values => Thermo_expansion_values
     procedure :: IonizationFunctionsAtTime
+    procedure :: IonizationFunctionsAtTimeAllFreq ! added for Rayleigh scattering
     procedure, private :: DoWindowSpline
     procedure, private :: SetTimeSteps
     procedure, private :: SetTimeStepWindows
@@ -1699,10 +1718,10 @@
         call MpiStop('thermo out of bounds')
     else if (i >= this%nthermo) then
         cs2b=this%cs2(this%nthermo)
-        opacity=this%dotmu(this%nthermo)
+        opacity=this%dotmu(this%nthermo,1) ! channel 1 (primary), added for Rayleigh scattering
         a=1
         if (present(dopacity)) then
-            dopacity = this%ddotmu(this%nthermo)/(tau*this%dlntau)
+            dopacity = this%ddotmu(this%nthermo,1)/(tau*this%dlntau) ! channel 1 (primary), added for Rayleigh scattering
         end if
     else
         associate(cs2_coeffs => this%thermo_horner(i)%cs2b, &
@@ -1733,7 +1752,7 @@
     if (i < 1) then
         call MpiStop('thermo out of bounds')
     else if (i >= this%nthermo) then
-        opacity=this%dotmu(this%nthermo)
+        opacity=this%dotmu(this%nthermo,1) ! channel 1 (primary), added for Rayleigh scattering
         a=1
         adot=this%adot(this%nthermo)
     else
@@ -1757,7 +1776,7 @@
     !Do this the bad slow way for now..
     !The answer is approximate
     j =1
-    do while(this%dotmu(j)> opacity)
+    do while(this%dotmu(j,1)> opacity) ! channel 1 (primary), added for Rayleigh scattering
         j=j+1
     end do
 
@@ -1780,6 +1799,7 @@
     real(dl) adot,fe,thomc0
     real(dl) dtbdla,vfi,cf1,maxvis, vis, z_scale
     integer ncount,i,j1,iv,ns
+    integer f_i ! added for Rayleigh scattering, per-frequency-channel loop index
     real(dl), allocatable :: spline_data(:)
     real(dl) last_dotmu, om
     real(dl) a_verydom
@@ -1801,12 +1821,14 @@
     real(dl) :: T_reion, denom, yheat, Tg, muinv, cs2_orig, cs2_heat, Tb_orig, xe_HHeI
     logical :: thermo_use_omp
     Type(TCubicSpline) :: dotmuSp
+    Type(TCubicSpline) :: dotmuSpFreq ! added for Rayleigh scattering, separate spline object for per-channel optical depth
     integer ninverse, nlin
     real(dl) dlna, zstar_min, zstar_max
     real(dl) reion_z_start, reion_z_complete
     Type(CAMBParams), pointer :: CP
 
     CP => State%CP
+    this%num_cmb_freq = Rayleigh_NumFreq(CP%SourceTerms) ! added for Rayleigh scattering, one source of truth
     thermo_use_omp = .false.
     !$ thermo_use_omp = omp_get_max_threads() > 1
     this%has_lensing_windows = .false.
@@ -1836,7 +1858,9 @@
     this%nthermo = nthermo
     allocate(spline_data(nthermo), sdotmu(nthermo), dcs2(nthermo))
 
-    if (allocated(this%tb) .and. this%nthermo/=size(this%tb)) then
+    ! nscatter re-check added for Rayleigh scattering: also reallocate if the number of
+    ! frequency channels changed between calls, even when the thermo grid size (nthermo) did not
+    if (allocated(this%tb) .and. (this%nthermo/=size(this%tb) .or. size(this%dotmu,2)/=this%num_cmb_freq+1)) then
         deallocate(this%scaleFactor, this%cs2, this%ddotmu)
         deallocate(this%adot, this%dadot)
         deallocate(this%tb, this%xe, this%emmu, this%dotmu)
@@ -1845,10 +1869,12 @@
         if (dowinlens .and. allocated(this%winlens)) deallocate(this%winlens, this%dwinlens)
     endif
     if (.not. allocated(this%tb)) then
-        allocate(this%scaleFactor(nthermo), this%cs2(nthermo), this%ddotmu(nthermo))
+        allocate(this%scaleFactor(nthermo), this%cs2(nthermo), this%ddotmu(nthermo,this%num_cmb_freq+1))
         allocate(this%adot(nthermo), this%dadot(nthermo))
-        allocate(this%tb(nthermo), this%xe(nthermo), this%emmu(nthermo),this%dotmu(nthermo))
-        allocate(this%demmu(nthermo), this%dddotmu(nthermo), this%ddddotmu(nthermo))
+        allocate(this%tb(nthermo), this%xe(nthermo), this%emmu(nthermo,this%num_cmb_freq+1),&
+            this%dotmu(nthermo,this%num_cmb_freq+1))
+        allocate(this%demmu(nthermo,this%num_cmb_freq+1), this%dddotmu(nthermo,this%num_cmb_freq+1), &
+            this%ddddotmu(nthermo,this%num_cmb_freq+1))
         allocate(this%thermo_horner(nthermo))
         if (dowinlens) allocate(this%winlens(nthermo), this%dwinlens(nthermo))
     end if
@@ -2048,7 +2074,13 @@
     call CP%Recomb%xe_tm(a0,this%xe(1), this%tb(1))
     barssc=barssc0*(1._dl-0.75d0*CP%yhe+(1._dl-CP%yhe)*this%xe(1))
     this%cs2(1)=4._dl/3._dl*barssc*this%tb(1)
-    this%dotmu(1)=this%xe(1)*State%akthom/a0**2
+    this%dotmu(1,1)=this%xe(1)*State%akthom/a0**2
+    ! per-frequency opacity at the first tabulated point, added for Rayleigh scattering
+    ! (camb_rayleigh_lewis/modules.f90:2930-2933)
+    do f_i=1,this%num_cmb_freq
+        this%dotmu(1,1+f_i)=this%dotmu(1,1) + CP%Recomb%Recombination_rayleigh_eff(a0)*State%akthom/a0**2 * &
+            Rayleigh_OpacityFactor(CP%SourceTerms%rayleigh_frequencies(f_i), a0)
+    end do
 
 
     !$OMP PARALLEL DO DEFAULT(SHARED), SCHEDULE(STATIC,16) NUM_THREADS(2) IF(thermo_use_omp)
@@ -2086,12 +2118,12 @@
             end if
             this%xe(i) = CP%Reion%x_e(1/a-1, tau, this%xe(ncount))
             if (CP%Accuracy%AccurateReionization .and. CP%WantDerivedParameters) then
-                this%dotmu(i)=(xe_a(i) - this%xe(i))*State%akthom/a2
+                this%dotmu(i,1)=(xe_a(i) - this%xe(i))*State%akthom/a2 ! channel 1 (primary) scratch value, unrelated to Rayleigh
 
                 if (last_dotmu /=0) then
-                    this%actual_opt_depth = this%actual_opt_depth - 2._dl*(tau-taus(i-1))/(1._dl/this%dotmu(i)+1._dl/last_dotmu)
+                    this%actual_opt_depth = this%actual_opt_depth - 2._dl*(tau-taus(i-1))/(1._dl/this%dotmu(i,1)+1._dl/last_dotmu)
                 end if
-                last_dotmu = this%dotmu(i)
+                last_dotmu = this%dotmu(i,1)
             end if
         else
             this%xe(i)=xe_a(i)
@@ -2138,9 +2170,23 @@
         end if
 
         ! Calculation of the visibility function
-        this%dotmu(i)=this%xe(i)*State%akthom/a2
+        this%dotmu(i,1)=this%xe(i)*State%akthom/a2
 
-        if (this%tight_tau==0 .and. 1/(tau*this%dotmu(i)) > 0.005) this%tight_tau = tau !0.005
+        !##################################################################
+        !######### feature added for Rayleigh scattering #############
+        !########## per-frequency opacity = Thomson (primary, above) +
+        !########## Rayleigh (neutral atoms, freq/redshift scaled, capped
+        !########## at Thomson) (camb_rayleigh_lewis/modules.f90:2930-2933)
+        !##################################################################
+        do f_i=1,this%num_cmb_freq
+            this%dotmu(i,1+f_i)=this%dotmu(i,1) + CP%Recomb%Recombination_rayleigh_eff(a)*State%akthom/a2 * &
+                Rayleigh_OpacityFactor(CP%SourceTerms%rayleigh_frequencies(f_i), a)
+        end do
+        !###################################################################
+        !################ end of feature ########################
+        !###################################################################
+
+        if (this%tight_tau==0 .and. 1/(tau*this%dotmu(i,1)) > 0.005) this%tight_tau = tau !0.005
         !Tight coupling switch time when k/opacity is smaller than 1/(tau*opacity)
     end do
 
@@ -2151,21 +2197,48 @@
     end if
 
     !Integrate for optical depth
-    call dotmuSp%Init(taus(nthermo:1:-1), this%dotmu(nthermo:1:-1))
+    call dotmuSp%Init(taus(nthermo:1:-1), this%dotmu(nthermo:1:-1,1))
     allocate(opts(nthermo))
     call dotmuSp%IntegralArray(opts)
     sdotmu = opts(nthermo:1:-1)
     do j1=1,nthermo
         if (sdotmu(j1)< -69) then
-            this%emmu(j1)=1.d-30
+            this%emmu(j1,1)=1.d-30
         else
-            this%emmu(j1)=exp(sdotmu(j1))
+            this%emmu(j1,1)=exp(sdotmu(j1))
             if (CP%Reion%Reionization .and. .not. CP%Accuracy%AccurateReionization .and. &
                 this%actual_opt_depth==0 .and. this%xe(j1) < 1e-3) then
                 this%actual_opt_depth = -sdotmu(j1)
             end if
         end if
     end do
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## per-frequency optical depth + emmu, same integration
+    !########## method as the primary channel just above, applied to
+    !########## each Rayleigh channel's own opacity column
+    !##################################################################
+    do f_i=1,this%num_cmb_freq
+        call dotmuSpFreq%Init(taus(nthermo:1:-1), this%dotmu(nthermo:1:-1,1+f_i))
+        call dotmuSpFreq%IntegralArray(opts)
+        sdotmu = opts(nthermo:1:-1)
+        do j1=1,nthermo
+            if (sdotmu(j1)< -69) then
+                this%emmu(j1,1+f_i)=1.d-30
+            else
+                this%emmu(j1,1+f_i)=exp(sdotmu(j1))
+            end if
+        end do
+        call unit_grid_pade_derivative(this%dotmu(:,1+f_i),this%ddotmu(:,1+f_i),nthermo,spline_data)
+        call unit_grid_pade_derivative(this%ddotmu(:,1+f_i),this%dddotmu(:,1+f_i),nthermo,spline_data)
+        call unit_grid_pade_derivative(this%dddotmu(:,1+f_i),this%ddddotmu(:,1+f_i),nthermo,spline_data)
+        call unit_grid_pade_derivative(this%emmu(:,1+f_i),this%demmu(:,1+f_i),nthermo,spline_data)
+    end do
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
+
     z_scale =  COBE_CMBTemp/CP%TCMB
     zstar_min = 700._dl * z_scale
     zstar_max = 2000._dl * z_scale
@@ -2209,7 +2282,7 @@
     end if
     maxvis = 0
     do j1=1,ns
-        vis = this%emmu(j1)*this%dotmu(j1)
+        vis = this%emmu(j1,1)*this%dotmu(j1,1) ! channel 1 (primary), added for Rayleigh scattering
         tau = taus(j1)
         vfi=vfi+vis*cf1*this%dlntau*tau
         if ((iv == 0).and.(vfi > 1.0d-7/CP%Accuracy%AccuracyBoost)) then
@@ -2243,7 +2316,7 @@
         awin_lens2p=0
         this%winlens=0
         do j1=1,nthermo-1
-            vis = this%emmu(j1)*this%dotmu(j1)
+            vis = this%emmu(j1,1)*this%dotmu(j1,1) ! channel 1 (primary), added for Rayleigh scattering
             tau = taus(j1)
             vfi=vfi+vis*cf1*this%dlntau*tau
             if (vfi < 0.995) then
@@ -2274,20 +2347,20 @@
     !$OMP PARALLEL SECTIONS DEFAULT(SHARED), PRIVATE(j2, sf1, sf2, dSF1, dSF2, delta) &
     !$OMP NUM_THREADS(2) IF(thermo_use_omp)
     !$OMP SECTION
-    call unit_grid_pade_derivative(this%dotmu,this%ddotmu,nthermo,spline_data)
-    call unit_grid_pade_derivative(this%ddotmu,this%dddotmu,nthermo,spline_data)
-    call unit_grid_pade_derivative(this%dddotmu,this%ddddotmu,nthermo,spline_data)
+    call unit_grid_pade_derivative(this%dotmu(:,1),this%ddotmu(:,1),nthermo,spline_data)
+    call unit_grid_pade_derivative(this%ddotmu(:,1),this%dddotmu(:,1),nthermo,spline_data)
+    call unit_grid_pade_derivative(this%dddotmu(:,1),this%ddddotmu(:,1),nthermo,spline_data)
     do j2 = 1, nthermo - 1
         associate(horner => this%thermo_horner(j2))
-            horner%opacity(1) = this%dotmu(j2)
-            horner%opacity(2) = this%ddotmu(j2)
-            horner%opacity(3) = 3*(this%dotmu(j2+1) - this%dotmu(j2)) - 2*this%ddotmu(j2) - this%ddotmu(j2+1)
-            horner%opacity(4) = this%ddotmu(j2) + this%ddotmu(j2+1) + 2*(this%dotmu(j2) - this%dotmu(j2+1))
+            horner%opacity(1) = this%dotmu(j2,1)
+            horner%opacity(2) = this%ddotmu(j2,1)
+            horner%opacity(3) = 3*(this%dotmu(j2+1,1) - this%dotmu(j2,1)) - 2*this%ddotmu(j2,1) - this%ddotmu(j2+1,1)
+            horner%opacity(4) = this%ddotmu(j2,1) + this%ddotmu(j2+1,1) + 2*(this%dotmu(j2,1) - this%dotmu(j2+1,1))
 
-            horner%dopacity(1) = this%ddotmu(j2)
-            horner%dopacity(2) = this%dddotmu(j2)
-            horner%dopacity(3) = 3*(this%ddotmu(j2+1) - this%ddotmu(j2)) - 2*this%dddotmu(j2) - this%dddotmu(j2+1)
-            horner%dopacity(4) = this%dddotmu(j2) + this%dddotmu(j2+1) + 2*(this%ddotmu(j2) - this%ddotmu(j2+1))
+            horner%dopacity(1) = this%ddotmu(j2,1)
+            horner%dopacity(2) = this%dddotmu(j2,1)
+            horner%dopacity(3) = 3*(this%ddotmu(j2+1,1) - this%ddotmu(j2,1)) - 2*this%dddotmu(j2,1) - this%dddotmu(j2+1,1)
+            horner%dopacity(4) = this%dddotmu(j2,1) + this%dddotmu(j2+1,1) + 2*(this%ddotmu(j2,1) - this%ddotmu(j2+1,1))
         end associate
     end do
     if (CP%want_zstar .or. CP%WantDerivedParameters) &
@@ -2322,7 +2395,7 @@
     call this%SetTimeSteps(State,State%TimeSteps)
     !$OMP SECTION
     call unit_grid_pade_derivative(this%cs2,dcs2,nthermo,spline_data)
-    call unit_grid_pade_derivative(this%emmu,this%demmu,nthermo,spline_data)
+    call unit_grid_pade_derivative(this%emmu(:,1),this%demmu(:,1),nthermo,spline_data)
     call unit_grid_pade_derivative(this%adot,this%dadot,nthermo,spline_data)
     do j2 = 1, nthermo - 1
         associate(horner => this%thermo_horner(j2))
@@ -2914,14 +2987,15 @@
     d=d-i
 
     if (i < this%nthermo) then
-        ddopac=(this%dddotmu(i)+d*(this%ddddotmu(i)+d*(3._dl*(this%dddotmu(i+1) &
-            -this%dddotmu(i))-2._dl*this%ddddotmu(i)-this%ddddotmu(i+1)  &
-            +d*(this%ddddotmu(i)+this%ddddotmu(i+1)+2._dl*(this%dddotmu(i) &
-            -this%dddotmu(i+1)))))-(this%dlntau**2)*tau*dopac) &
+        ! channel 1 (primary) indexing added for Rayleigh scattering; formula itself unchanged
+        ddopac=(this%dddotmu(i,1)+d*(this%ddddotmu(i,1)+d*(3._dl*(this%dddotmu(i+1,1) &
+            -this%dddotmu(i,1))-2._dl*this%ddddotmu(i,1)-this%ddddotmu(i+1,1)  &
+            +d*(this%ddddotmu(i,1)+this%ddddotmu(i+1,1)+2._dl*(this%dddotmu(i,1) &
+            -this%dddotmu(i+1,1)))))-(this%dlntau**2)*tau*dopac) &
             /(tau*this%dlntau)**2
-        expmmu=this%emmu(i)+d*(this%demmu(i)+d*(3._dl*(this%emmu(i+1)-this%emmu(i)) &
-            -2._dl*this%demmu(i)-this%demmu(i+1)+d*(this%demmu(i)+this%demmu(i+1) &
-            +2._dl*(this%emmu(i)-this%emmu(i+1)))))
+        expmmu=this%emmu(i,1)+d*(this%demmu(i,1)+d*(3._dl*(this%emmu(i+1,1)-this%emmu(i,1)) &
+            -2._dl*this%demmu(i,1)-this%demmu(i+1,1)+d*(this%demmu(i,1)+this%demmu(i+1,1) &
+            +2._dl*(this%emmu(i,1)-this%emmu(i+1,1)))))
 
         if (dowinlens) then
             lenswin=this%winlens(i)+d*(this%dwinlens(i)+d*(3._dl*(this%winlens(i+1)-this%winlens(i)) &
@@ -2932,14 +3006,83 @@
         dvis=expmmu*(opac**2+dopac)
         ddvis=expmmu*(opac**3+3*opac*dopac+ddopac)
     else
-        ddopac=this%dddotmu(this%nthermo)
-        expmmu=this%emmu(this%nthermo)
+        ddopac=this%dddotmu(this%nthermo,1) ! channel 1 (primary), added for Rayleigh scattering
+        expmmu=this%emmu(this%nthermo,1) ! channel 1 (primary), added for Rayleigh scattering
         vis=opac*expmmu
         dvis=expmmu*(opac**2+dopac)
         ddvis=expmmu*(opac**3+3._dl*opac*dopac+ddopac)
     end if
 
     end subroutine IonizationFunctionsAtTime
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## Sibling of IonizationFunctionsAtTime above, generalized
+    !########## to the full frequency axis (scat=1 reproduces the
+    !########## primary exactly; scat=2..nscatter are the Rayleigh
+    !########## channels). Kept as a separate procedure rather than
+    !########## changing IonizationFunctionsAtTime's own signature, so
+    !########## its existing callers (derivs/outputt/outputv and the
+    !########## Python background-evolution export) are untouched --
+    !########## Stage 2 must not change any Cl. Later stages that need
+    !########## per-frequency dynamics/sources should call this instead.
+    !##################################################################
+    subroutine IonizationFunctionsAtTimeAllFreq(this,tau, a, opac, dopac, ddopac, &
+        vis, dvis, ddvis, expmmu, lenswin)
+    class(TThermoData) :: this
+    real(dl), intent(in) :: tau
+    real(dl), intent(out):: a, lenswin
+    real(dl), intent(out), dimension(this%num_cmb_freq+1) :: opac, dopac, ddopac, vis, dvis, ddvis, expmmu
+    real(dl) d, cs2, dummy_opac, dummy_dopac
+    integer i, scat
+
+    ! a/cs2 are frequency-independent; reuse the existing single-channel accessor for them
+    call this%Values(tau,a,cs2,dummy_opac,dummy_dopac)
+
+    d=log(tau/this%tauminn)/this%dlntau+1._dl
+    i=int(d)
+    d=d-i
+
+    do scat=1,this%num_cmb_freq+1
+        if (i < this%nthermo) then
+            opac(scat)=this%dotmu(i,scat)+d*(this%ddotmu(i,scat)+d*(3._dl*(this%dotmu(i+1,scat)-this%dotmu(i,scat)) &
+                -2._dl*this%ddotmu(i,scat)-this%ddotmu(i+1,scat)+d*(this%ddotmu(i,scat)+this%ddotmu(i+1,scat) &
+                +2._dl*(this%dotmu(i,scat)-this%dotmu(i+1,scat)))))
+            dopac(scat)=(this%ddotmu(i,scat)+d*(this%dddotmu(i,scat)+d*(3._dl*(this%ddotmu(i+1,scat) &
+                -this%ddotmu(i,scat))-2._dl*this%dddotmu(i,scat)-this%dddotmu(i+1,scat)+d*(this%dddotmu(i,scat) &
+                +this%dddotmu(i+1,scat)+2._dl*(this%ddotmu(i,scat)-this%ddotmu(i+1,scat))))))/(tau*this%dlntau)
+            ddopac(scat)=(this%dddotmu(i,scat)+d*(this%ddddotmu(i,scat)+d*(3._dl*(this%dddotmu(i+1,scat) &
+                -this%dddotmu(i,scat))-2._dl*this%ddddotmu(i,scat)-this%ddddotmu(i+1,scat)  &
+                +d*(this%ddddotmu(i,scat)+this%ddddotmu(i+1,scat)+2._dl*(this%dddotmu(i,scat) &
+                -this%dddotmu(i+1,scat)))))-(this%dlntau**2)*tau*dopac(scat)) &
+                /(tau*this%dlntau)**2
+            expmmu(scat)=this%emmu(i,scat)+d*(this%demmu(i,scat)+d*(3._dl*(this%emmu(i+1,scat)-this%emmu(i,scat)) &
+                -2._dl*this%demmu(i,scat)-this%demmu(i+1,scat)+d*(this%demmu(i,scat)+this%demmu(i+1,scat) &
+                +2._dl*(this%emmu(i,scat)-this%emmu(i+1,scat)))))
+
+            if (scat==1 .and. dowinlens) then
+                lenswin=this%winlens(i)+d*(this%dwinlens(i)+d*(3._dl*(this%winlens(i+1)-this%winlens(i)) &
+                    -2._dl*this%dwinlens(i)-this%dwinlens(i+1)+d*(this%dwinlens(i)+this%dwinlens(i+1) &
+                    +2._dl*(this%winlens(i)-this%winlens(i+1)))))
+            end if
+            vis(scat)=opac(scat)*expmmu(scat)
+            dvis(scat)=expmmu(scat)*(opac(scat)**2+dopac(scat))
+            ddvis(scat)=expmmu(scat)*(opac(scat)**3+3*opac(scat)*dopac(scat)+ddopac(scat))
+        else
+            opac(scat)=this%dotmu(this%nthermo,scat)
+            dopac(scat)=this%ddotmu(this%nthermo,scat)/(tau*this%dlntau)
+            ddopac(scat)=this%dddotmu(this%nthermo,scat)
+            expmmu(scat)=this%emmu(this%nthermo,scat)
+            vis(scat)=opac(scat)*expmmu(scat)
+            dvis(scat)=expmmu(scat)*(opac(scat)**2+dopac(scat))
+            ddvis(scat)=expmmu(scat)*(opac(scat)**3+3._dl*opac(scat)*dopac(scat)+ddopac(scat))
+        end if
+    end do
+
+    end subroutine IonizationFunctionsAtTimeAllFreq
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
 
     subroutine Init_ClTransfer(CTrans)
     !Need to set the Ranges array q before calling this

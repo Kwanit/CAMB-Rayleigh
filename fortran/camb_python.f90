@@ -802,6 +802,102 @@
 
     end function CAMB_TimeEvolution
 
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## Stage 3b validation-only accessor: per-frequency-channel
+    !########## photon multipole evolution vs conformal time, for one
+    !########## requested Rayleigh band. Mirrors GetOutputEvolutionFork/
+    !########## CAMB_TimeEvolution above exactly (same per-k setup and
+    !########## GaugeInterface_EvolveScal driving loop) but additionally
+    !########## reads the per-frequency indices reserved since Stage 1
+    !########## and reconstructs FULL (not increment) channel multipoles
+    !########## as primary + increment, since 3b's own state variables
+    !########## are increments (see the per-channel RHS in `derivs`).
+    !########## Not part of the final Cl-output API (Stage 4/5) -- exists
+    !########## purely to validate the Stage 3b hierarchy against Antony.
+    !##################################################################
+    function CAMB_RayleighMultipoleEvolution(this, nq, q, ntimes, times, freq_index, noutputs, outputs) result(err)
+    use GaugeInterface
+    use CAMBmain
+    Type(CAMBdata), target :: this
+    integer, intent(in) :: nq, ntimes, freq_index, noutputs
+    real(dl), intent(in) :: q(nq), times(ntimes)
+    real(dl), intent(out) :: outputs(noutputs, ntimes, nq)
+    integer err, q_ix
+    real(dl) taustart
+    Type(EvolutionVars) :: EV
+
+    call SetActiveState(this)
+    global_error_flag = 0
+    outputs = 0
+    taustart = min(times(1),GetTauStart(maxval(q)))
+    if (.not. this%ThermoData%HasTHermoData .or. taustart < this%ThermoData%tauminn) call this%ThermoData%Init(this,taustart)
+    !$OMP PARALLEL DO DEFAUlT(SHARED),SCHEDUlE(DYNAMIC), PRIVATE(EV, q_ix)
+    do q_ix= 1, nq
+        if (global_error_flag==0) then
+            EV%q_ix = q_ix
+            EV%q = q(q_ix)
+            EV%TransferOnly=.false.
+            EV%q2=EV%q**2
+            EV%ThermoData => this%ThermoData
+            call GetNumEqns(EV)
+            call GetRayleighMultipoleEvolutionFork(EV, times, freq_index, outputs(:,:,q_ix))
+        end if
+    end do
+    !$OMP END PARALLEL DO
+    err = global_error_flag
+    end function CAMB_RayleighMultipoleEvolution
+
+    subroutine GetRayleighMultipoleEvolutionFork(EV, times, freq_index, outputs)
+    use CAMBmain
+    type(EvolutionVars) EV
+    real(dl), intent(in) :: times(:)
+    integer, intent(in) :: freq_index
+    real(dl), intent(out) :: outputs(:,:)
+    ! outputs rows: 1=Rayleigh flag(0/1), 2=primary monopole, 3=primary dipole,
+    ! 4=primary quadrupole, 5=primary octupole, 6=channel FULL monopole,
+    ! 7=channel FULL dipole, 8=channel FULL quadrupole, 9=channel FULL octupole
+    real(dl) tau,tol1,tauend, taustart
+    integer j,ind, ix_ch
+    type(RungeKuttaDP45Settings) :: rk_settings
+    real(dl) w(EV%nvar,9), y(EV%nvar)
+    procedure(obj_function) :: dtauda
+
+    w=0
+    y=0
+    outputs=0
+    taustart = GetTauStart(min(500._dl,EV%q))
+    call initial(EV,y, taustart)
+
+    tau=taustart
+    ind=1
+    tol1=base_tol/exp(CP%Accuracy%AccuracyBoost*CP%Accuracy%IntTolBoost-1)
+    do j=1,size(times)
+        tauend = times(j)
+        if (tauend<taustart) cycle
+
+        call GaugeInterface_EvolveScal(EV, tau, y, tauend, tol1, ind, rk_settings, w)
+        outputs(1,j) = merge(1._dl, 0._dl, EV%Rayleigh)
+        if (.not. EV%no_phot_multpoles .and. .not. EV%TightCoupling) then
+            outputs(2,j) = y(EV%g_ix)
+            outputs(3,j) = y(EV%g_ix+1)
+            outputs(4,j) = y(EV%g_ix+2)
+            if (EV%lmaxg>2) outputs(5,j) = y(EV%g_ix+3)
+            if (EV%Rayleigh) then
+                ix_ch = EV%g_ix_freq + (freq_index-1)*EV%freq_neq
+                outputs(6,j) = y(EV%g_ix)   + y(ix_ch)
+                outputs(7,j) = y(EV%g_ix+1) + y(ix_ch+1)
+                outputs(8,j) = y(EV%g_ix+2) + y(ix_ch+2)
+                if (EV%lmaxg>2) outputs(9,j) = y(EV%g_ix+3) + y(ix_ch+3)
+            end if
+        end if
+
+        if (global_error_flag/=0) return
+    end do
+    end subroutine GetRayleighMultipoleEvolutionFork
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
 
     subroutine GetBackgroundThermalEvolution(this, ntimes, times, outputs)
     use Interpolation, only : TLogRegularCubicSpline
@@ -845,5 +941,57 @@
     end associate
 
     end subroutine GetBackgroundThermalEvolution
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## Stage 2 validation-only accessor: per-frequency
+    !########## opacity/visibility/optical-depth vs conformal time,
+    !########## mirroring GetBackgroundThermalEvolution above but using
+    !########## IonizationFunctionsAtTimeAllFreq. Rows are grouped
+    !########## [opacity, visibility, exptau] per channel, channel 1 =
+    !########## primary, channels 2.. = Rayleigh bands in the order set
+    !########## via SourceTerms%rayleigh_frequencies. Not part of the
+    !########## final Cl-output API (that is Stage 4/5) -- this exists
+    !########## purely so the per-frequency thermodynamic functions can
+    !########## be validated from Python against the reference branches.
+    !##################################################################
+    subroutine GetRayleighThermalEvolution(this, ntimes, times, nrows, outputs)
+    Type(CAMBdata) :: this
+    integer, intent(in) :: ntimes, nrows
+    real(dl), intent(in) :: times(ntimes)
+    real(dl) :: outputs(nrows, ntimes)
+    real(dl) :: a, lenswindow
+    real(dl), dimension(:), allocatable :: opacity, dopacity, ddopacity, visibility, dvisibility, ddvisibility, exptau
+    integer ix, scat, nscatter
+
+    if (.not. this%ThermoData%HasTHermoData) call this%ThermoData%Init(this,min(1d-3,max(1d-5,minval(times))))
+
+    associate(T=>this%ThermoData)
+        nscatter = T%num_cmb_freq+1
+        if (nrows /= 3*nscatter) then
+            call GlobalError('GetRayleighThermalEvolution: outputs sized for wrong number of frequency channels', &
+                error_unsupported_params)
+            return
+        end if
+        allocate(opacity(nscatter), dopacity(nscatter), ddopacity(nscatter))
+        allocate(visibility(nscatter), dvisibility(nscatter), ddvisibility(nscatter), exptau(nscatter))
+
+        outputs = 0
+        do ix = 1, ntimes
+            if (times(ix) < T%tauminn*1.01) cycle
+            call T%IonizationFunctionsAtTimeAllFreq(times(ix), a, opacity, dopacity, ddopacity, &
+                visibility, dvisibility, ddvisibility, exptau, lenswindow)
+            do scat=1,nscatter
+                outputs(3*(scat-1)+1, ix) = opacity(scat)
+                outputs(3*(scat-1)+2, ix) = visibility(scat)
+                outputs(3*(scat-1)+3, ix) = exptau(scat)
+            end do
+        end do
+    end associate
+
+    end subroutine GetRayleighThermalEvolution
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
 
     end module handles

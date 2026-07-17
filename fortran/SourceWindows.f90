@@ -68,6 +68,20 @@
         logical :: line_extra = .false.
         logical :: line_reionization = .false.
         logical :: use_21cm_mK = .true.
+        !##################################################################
+        !######### feature added for Rayleigh scattering #############
+        !########## Stage 1 plumbing: an on/off switch plus a
+        !########## Python-settable, variable-length list of Rayleigh
+        !########## scattering frequency channels (GHz). num_cmb_freq/
+        !########## nscatter must always be derived from the length of
+        !########## rayleigh_frequencies (see Rayleigh_NumFreq below) --
+        !########## never re-declared locally elsewhere.
+        !##################################################################
+        logical :: rayleigh_scattering = .false.
+        real(dl), allocatable :: rayleigh_frequencies(:)
+        !###################################################################
+        !################ end of feature ########################
+        !###################################################################
     end type SourceTermParams
 
     Type TRedWin !internal type
@@ -359,5 +373,59 @@
     end associate
 
     end subroutine TSplinedSourceWindow_GetScales
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## Single source of truth for the number of active
+    !########## Rayleigh frequency channels. Returns 0 (Rayleigh fully
+    !########## inert) unless rayleigh_scattering is on AND a nonempty
+    !########## frequency list has been set. Every subroutine that
+    !########## needs num_cmb_freq/nscatter must call this rather than
+    !########## caching or re-deriving the count itself.
+    !##################################################################
+    pure function Rayleigh_NumFreq(SourceTerms) result(num_cmb_freq)
+    Type(SourceTermParams), intent(in) :: SourceTerms
+    integer :: num_cmb_freq
+
+    if (SourceTerms%rayleigh_scattering .and. allocated(SourceTerms%rayleigh_frequencies)) then
+        num_cmb_freq = size(SourceTerms%rayleigh_frequencies)
+    else
+        num_cmb_freq = 0
+    end if
+
+    end function Rayleigh_NumFreq
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## nu^4 + nu^6 + nu^8 Rayleigh cross-section expansion,
+    !########## relative to Thomson, as a function of frequency and
+    !########## scale factor. EXACT old-branch normalization and
+    !########## coefficients (physics/logic oracle:
+    !########## camb_rayleigh_lewis/modules.f90:2778,2812-2814) --
+    !########## nu_eff and the two rational coefficients are quoted
+    !########## verbatim so the comparison is a direct equality check.
+    !########## This is the "inline formula available at arbitrary tau"
+    !########## access path later stages' derivs will need off the
+    !########## tabulated thermo grid (camb_rayleigh_lewis/equations.f90:2447-2449).
+    !##################################################################
+    pure function Rayleigh_OpacityFactor(freq_ghz, a) result(factor)
+    !min(1, sum of nu^4/nu^6/nu^8 terms over a^4/a^6/a^8), capped at Thomson
+    real(dl), intent(in) :: freq_ghz, a
+    real(dl) :: factor, a2, nu_ratio
+    real(dl), parameter :: nu_eff = 3101692._dl ! camb_rayleigh_lewis/modules.f90:2778
+    real(dl), parameter :: coeff6 = 638._dl/243 ! camb_rayleigh_lewis/modules.f90:2813
+    real(dl), parameter :: coeff8 = 1299667._dl/236196 ! camb_rayleigh_lewis/modules.f90:2814
+
+    a2 = a*a
+    nu_ratio = freq_ghz/nu_eff
+    factor = min(1._dl, nu_ratio**4/a2**2 + nu_ratio**6*coeff6/a2**3 + nu_ratio**8*coeff8/a2**4)
+
+    end function Rayleigh_OpacityFactor
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
 
     end module SourceWindows

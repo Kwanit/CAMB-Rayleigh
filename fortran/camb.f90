@@ -381,6 +381,7 @@
     class(TIniFile) :: Ini
     Type(CAMBParams) :: P
     integer num_redshiftwindows
+    integer num_rayleigh_freq ! added for Rayleigh scattering, count of ini-specified frequency channels
     logical PK_WantTransfer
     integer i, status, num_theta_inputs
     real(dl) nmassive, theta
@@ -484,6 +485,27 @@
         call Ini%Read('counts_potential', P%SourceTerms%counts_potential)
         call Ini%Read('counts_velocity', P%SourceTerms%counts_velocity)
     end if
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## ini registration (Stage 1 plumbing): an on/off switch
+    !########## plus a variable-length frequency list, read the same
+    !########## way num_redshiftwindows/redshift(i) are read above.
+    !########## num_cmb_freq/nscatter are never stored here -- they are
+    !########## always derived from the length of rayleigh_frequencies
+    !########## (see Rayleigh_NumFreq in SourceWindows.f90).
+    !##################################################################
+    call Ini%Read('rayleigh_scattering', P%SourceTerms%rayleigh_scattering)
+    num_rayleigh_freq = Ini%Read_Int('rayleigh_num_freq', 0)
+    if (num_rayleigh_freq > 0) then
+        allocate(P%SourceTerms%rayleigh_frequencies(num_rayleigh_freq))
+        do i=1, num_rayleigh_freq
+            P%SourceTerms%rayleigh_frequencies(i) = Ini%Read_Double_Array('rayleigh_frequency', i)
+        end do
+    end if
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
 
     P%OutputNormalization=outNone
 

@@ -260,6 +260,16 @@
         real(dl), private :: delta_z = 0._dl, minz = zfinal, maxz = zinitial
         real(dl), allocatable, private :: zrec(:), xrec(:), dxrec(:), Tsrec(:), dTsrec(:), tmrec(:), dtmrec(:), &
             xrec_horner(:, :), tsrec_horner(:, :), tmrec_horner(:, :)
+        !##################################################################
+        !######### feature added for Rayleigh scattering #############
+        !########## effective neutral-scatterer fraction (H + He), stored
+        !########## and splined the same way as xrec/dxrec/xrec_horner
+        !########## above (camb_rayleigh_lewis/recfast.f90:261,715)
+        !##################################################################
+        real(dl), allocatable, private :: x_rayleigh_eff(:), dx_rayleigh_eff(:), x_rayleigh_eff_horner(:, :)
+        !###################################################################
+        !################ end of feature ########################
+        !###################################################################
         ! tmrec stores a*Tmat = Tmat/(1+z)
         ! tsrec stores a*Tspin = Tspin/(1+z)
         real(dl), private :: DeltaB,DeltaB_He,Lalpha,mu_H,mu_T
@@ -307,6 +317,7 @@
     procedure :: dDeltaxe_dtau => TRecfast_dDeltaxe_dtau
     procedure :: get_Saha_z => TRecfast_Get_Saha_z
     procedure, nopass :: SelfPointer => TRecfast_SelfPointer
+    procedure :: Recombination_rayleigh_eff => TRecfast_Recombination_rayleigh_eff ! added for Rayleigh scattering
 
     end type TRecfast
 
@@ -318,6 +329,7 @@
     real(dl), parameter :: bigH=100.0D3/Mpc !Ho in s-1
     real(dl), parameter :: sigma = sigma_thomson
     real(dl), parameter :: not4  = mass_ratio_He_H    !mass He/H atom
+    real(dl), parameter :: HeRayleighFac = 0.1_dl ! added for Rayleigh scattering, He neutral-scattering cross section as ratio to H (camb_rayleigh_lewis/recfast.f90:253)
 
     real(dl), parameter :: B01 = 3*B10
 
@@ -503,6 +515,40 @@
     end associate
     end function TRecfast_xe
 
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## effective neutral-scatterer fraction accessor, mirrors
+    !########## TRecfast_xe above exactly but reads x_rayleigh_eff_horner
+    !########## (physics/logic oracle: camb_rayleigh_lewis/recfast.f90:460-482)
+    !##################################################################
+    function TRecfast_Recombination_rayleigh_eff(this,a)
+    class(TRecfast) :: this
+    real(dl), intent(in) :: a
+    real(dl) zst,z,az,TRecfast_Recombination_rayleigh_eff
+    integer ihi
+
+    z=1/a-1
+    associate(Calc => this%Calc)
+        if (z >= Calc%maxz) then
+            TRecfast_Recombination_rayleigh_eff=Calc%x_rayleigh_eff(1)
+        else
+            if (z <= Calc%minz) then
+                TRecfast_Recombination_rayleigh_eff=Calc%x_rayleigh_eff(Calc%nz)
+            else
+                zst = (zinitial - z)/Calc%delta_z
+                ihi = int(zst)
+                az = zst - real(ihi, dl)
+                TRecfast_Recombination_rayleigh_eff = Calc%x_rayleigh_eff_horner(1, ihi) + &
+                    az*(Calc%x_rayleigh_eff_horner(2, ihi) + az*(Calc%x_rayleigh_eff_horner(3, ihi) + &
+                    az*Calc%x_rayleigh_eff_horner(4, ihi)))
+            endif
+        endif
+    end associate
+    end function TRecfast_Recombination_rayleigh_eff
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
+
     subroutine TRecfast_xe_Tm(this,a, xe, Tm)
     class(TRecfast) :: this
     real(dl), intent(in) :: a
@@ -551,6 +597,8 @@
     if (needs_allocate .and. allocated(Calc%zrec)) then
         deallocate(Calc%zrec, Calc%xrec, Calc%dxrec, Calc%tsrec, Calc%dtsrec, Calc%tmrec, Calc%dtmrec, &
             Calc%xrec_horner, Calc%tsrec_horner, Calc%tmrec_horner)
+        ! added for Rayleigh scattering, deallocate alongside xrec/dxrec/xrec_horner above
+        deallocate(Calc%x_rayleigh_eff, Calc%dx_rayleigh_eff, Calc%x_rayleigh_eff_horner)
     end if
 
     Calc%nz = target_nz
@@ -561,6 +609,8 @@
         allocate(Calc%zrec(Calc%nz), Calc%xrec(Calc%nz), Calc%dxrec(Calc%nz), Calc%tsrec(Calc%nz), &
             Calc%dtsrec(Calc%nz), Calc%tmrec(Calc%nz), Calc%dtmrec(Calc%nz), Calc%xrec_horner(4, Calc%nz - 1), &
             Calc%tsrec_horner(4, Calc%nz - 1), Calc%tmrec_horner(4, Calc%nz - 1))
+        ! added for Rayleigh scattering, allocate alongside xrec/dxrec/xrec_horner above
+        allocate(Calc%x_rayleigh_eff(Calc%nz), Calc%dx_rayleigh_eff(Calc%nz), Calc%x_rayleigh_eff_horner(4, Calc%nz - 1))
     end if
     OK = .true.
 
@@ -798,6 +848,8 @@
             Calc%zrec(i) = zend
             Calc%xrec(i) = x
             Calc%tmrec(i) = y(3)
+            ! effective neutral-scatterer fraction, added for Rayleigh scattering (camb_rayleigh_lewis/recfast.f90:715)
+            Calc%x_rayleigh_eff(i) = (1._dl - x_H) + HeRayleighFac*(1._dl - x_He)*Calc%fHe
 
 
             if (Calc%doTspin) then
@@ -828,6 +880,16 @@
             Calc%xrec_horner, Calc%nz)
         call cubic_spline_regular_horner_coefficients(Calc%delta_z, Calc%tmrec, Calc%dtmrec, &
             Calc%tmrec_horner, Calc%nz)
+        !##################################################################
+        !######### feature added for Rayleigh scattering #############
+        !########## spline x_rayleigh_eff the same way as xrec just above
+        !##################################################################
+        call cubic_spline_regular_second_derivs(-Calc%delta_z,Calc%x_rayleigh_eff,Calc%nz,Calc%dx_rayleigh_eff)
+        call cubic_spline_regular_horner_coefficients(Calc%delta_z, Calc%x_rayleigh_eff, Calc%dx_rayleigh_eff, &
+            Calc%x_rayleigh_eff_horner, Calc%nz)
+        !###################################################################
+        !################ end of feature ########################
+        !###################################################################
         if (Calc%doTspin) then
             call cubic_spline_regular_second_derivs(-Calc%delta_z,Calc%tsrec,Calc%nz,Calc%dtsrec)
             call cubic_spline_regular_horner_coefficients(Calc%delta_z, Calc%tsrec, Calc%dtsrec, &

@@ -247,6 +247,25 @@ class SourceTermParams(CAMB_Structure):
         ("line_extra", c_bool, "Include other sources"),
         ("line_reionization", c_bool, "Replace the E modes with 21cm polarization"),
         ("use_21cm_mK", c_bool, "Use mK units for 21cm"),
+        # ##################################################################
+        # ######### feature added for Rayleigh scattering #############
+        # ########## Stage 1 plumbing: real, Python-settable parameters --
+        # ########## no recompile needed. E.g.:
+        # ##########   pars.SourceTerms.rayleigh_scattering = True
+        # ##########   pars.SourceTerms.rayleigh_frequencies = [143, 217, 353, 545, 857]
+        # ########## num_cmb_freq/nscatter are derived solely from
+        # ########## len(rayleigh_frequencies) on the Fortran side -- there
+        # ########## is no separate count field to keep in sync here.
+        # ##################################################################
+        ("rayleigh_scattering", c_bool, "Include Rayleigh scattering frequency channels (off by default)"),
+        (
+            "rayleigh_frequencies",
+            AllocatableArrayDouble,
+            "Rayleigh scattering frequency channels in GHz; num_cmb_freq is derived from this list's length",
+        ),
+        # ###################################################################
+        # ################ end of feature ########################
+        # ###################################################################
     )
 
 

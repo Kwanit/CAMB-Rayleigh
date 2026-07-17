@@ -89,6 +89,22 @@ def _update_source_terms_ini(params: model.CAMBparams, state: CambIniFile) -> No
     state.set("use_mK", params.SourceTerms.use_21cm_mK)
     state.set("Kmax_Boost", params.Accuracy.KmaxBoost)
 
+    # ##################################################################
+    # ######### feature added for Rayleigh scattering #############
+    # ########## ini write-side (Stage 1 plumbing), mirroring the read
+    # ########## side in fortran/camb.f90:CAMB_ReadParams and the same
+    # ########## indexed-key convention used for transfer_redshift(i)
+    # ########## just below.
+    # ##################################################################
+    state.set("rayleigh_scattering", params.SourceTerms.rayleigh_scattering)
+    rayleigh_frequencies = params.SourceTerms.rayleigh_frequencies
+    state.set("rayleigh_num_freq", len(rayleigh_frequencies))
+    for index, freq in enumerate(rayleigh_frequencies, start=1):
+        state.set(f"rayleigh_frequency({index})", freq)
+    # ###################################################################
+    # ################ end of feature ########################
+    # ###################################################################
+
     if not params.SourceWindows:
         state.set("num_redshiftwindows", 0)
         return

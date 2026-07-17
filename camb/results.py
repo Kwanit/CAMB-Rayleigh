@@ -690,6 +690,100 @@ class CAMBdata(F2003Class):
 
         return self.get_background_time_evolution(self.conformal_time(z), vars, format)
 
+    # ##################################################################
+    # ######### feature added for Rayleigh scattering #############
+    # ########## Stage 2 validation-only accessor: per-frequency
+    # ########## opacity/visibility/optical-depth vs conformal time.
+    # ########## Not part of the final Cl-output API (Stage 4/5) --
+    # ########## exists purely to validate the Stage 2 thermodynamic
+    # ########## functions against the reference branches.
+    # ##################################################################
+    def get_rayleigh_thermal_evolution(self, eta: np.ndarray) -> dict[str, np.ndarray]:
+        """
+        Get per-frequency-channel opacity, visibility and optical depth (exp(-tau)) as a
+        function of conformal time. Channel 0 is the primary (Thomson-only); channels
+        1.. are the Rayleigh bands in the order set via ``SourceTerms.rayleigh_frequencies``.
+
+        :param eta: array of requested conformal times to output
+        :return: dict with keys 'opacity', 'visibility', 'exptau', each an
+            n_eta x n_channels array
+        """
+        nscatter = len(self.Params.SourceTerms.rayleigh_frequencies) + 1
+        outputs = np.zeros((eta.shape[0], 3 * nscatter))
+        CAMB_RayleighThermalEvolution(byref(self), byref(c_int(eta.shape[0])), eta, byref(c_int(3 * nscatter)), outputs)
+        return {
+            "opacity": outputs[:, 0::3],
+            "visibility": outputs[:, 1::3],
+            "exptau": outputs[:, 2::3],
+        }
+
+    # ##################################################################
+    # ######### feature added for Rayleigh scattering #############
+    # ########## Stage 3b validation-only accessor: per-frequency-channel
+    # ########## photon multipole evolution vs conformal time. Not part
+    # ########## of the final Cl-output API (Stage 4/5) -- exists purely
+    # ########## to validate the Stage 3b hierarchy against Antony.
+    # ##################################################################
+    def get_rayleigh_multipole_evolution(self, q, eta: np.ndarray, freq_index: int = 1) -> dict[str, np.ndarray]:
+        """
+        Get photon temperature multipole (monopole/dipole/quadrupole/octupole) evolution
+        vs conformal time, for the primary channel and one Rayleigh frequency channel
+        (full, reconstructed value = primary + increment).
+
+        :param q: wavenumber (scalar or array)
+        :param eta: array of requested conformal times to output
+        :param freq_index: 1-based index into SourceTerms.rayleigh_frequencies for the
+            channel to report
+        :return: dict with keys 'rayleigh_on' (0/1), 'primary_monopole'...'primary_octupole',
+            'channel_monopole'...'channel_octupole'; each n_q x n_eta (or n_eta if q scalar)
+        """
+        scalar_q = np.isscalar(q)
+        k = np.array([q], dtype=np.float64) if scalar_q else np.ascontiguousarray(q, dtype=np.float64)
+        times = np.asarray(np.atleast_1d(eta), dtype=np.float64)
+        # the underlying ODE integrator steps tau forward, so times must be passed
+        # increasing -- sort here and un-sort the output, mirroring get_time_evolution
+        indices = np.argsort(times)
+        i_rev = np.zeros(times.shape, dtype=int)
+        i_rev[indices] = np.arange(times.shape[0])
+        noutputs = 9
+        # Fortran side declares outputs(noutputs, ntimes, nq) (column-major, noutputs
+        # fastest-varying); the numpy array must use the REVERSED shape (nq, ntimes,
+        # noutputs) for the shared raw buffer to line up, mirroring get_time_evolution's
+        # (k.shape[0], times.shape[0], nvars) -- NOT the same axis order as Fortran.
+        outputs = np.zeros((k.shape[0], times.shape[0], noutputs))
+        err = CAMB_RayleighMultipoleEvolution(
+            byref(self),
+            byref(c_int(k.shape[0])),
+            k,
+            byref(c_int(times.shape[0])),
+            times[indices],
+            byref(c_int(freq_index)),
+            byref(c_int(noutputs)),
+            outputs,
+        )
+        if err:
+            raise CAMBError("Error in get_rayleigh_multipole_evolution")
+        outputs = outputs[:, i_rev, :]
+        names = [
+            "rayleigh_on",
+            "primary_monopole",
+            "primary_dipole",
+            "primary_quadrupole",
+            "primary_octupole",
+            "channel_monopole",
+            "channel_dipole",
+            "channel_quadrupole",
+            "channel_octupole",
+        ]
+        result = {}
+        for i, name in enumerate(names):
+            arr = outputs[:, :, i]  # (n_q, n_eta)
+            result[name] = arr[0] if scalar_q else arr
+        return result
+    # ###################################################################
+    # ################ end of feature ########################
+    # ###################################################################
+
     @overload
     def get_background_densities(self, a: float, vars=model.density_names, format="dict") -> dict | np.ndarray: ...
 
@@ -1925,6 +2019,24 @@ CAMB_TimeEvolution.argtypes = [
 
 CAMB_BackgroundThermalEvolution = camblib.__handles_MOD_getbackgroundthermalevolution
 CAMB_BackgroundThermalEvolution.argtypes = [POINTER(CAMBdata), int_arg, numpy_1d, numpy_2d]
+
+# added for Rayleigh scattering, Stage 2 validation-only accessor (see camb_python.f90)
+CAMB_RayleighThermalEvolution = camblib.__handles_MOD_getrayleighthermalevolution
+CAMB_RayleighThermalEvolution.argtypes = [POINTER(CAMBdata), int_arg, numpy_1d, int_arg, numpy_2d]
+
+# added for Rayleigh scattering, Stage 3b validation-only accessor (see camb_python.f90)
+CAMB_RayleighMultipoleEvolution = camblib.__handles_MOD_camb_rayleighmultipoleevolution
+CAMB_RayleighMultipoleEvolution.restype = c_int
+CAMB_RayleighMultipoleEvolution.argtypes = [
+    POINTER(CAMBdata),
+    int_arg,
+    numpy_1d,
+    int_arg,
+    numpy_1d,
+    int_arg,
+    int_arg,
+    ndpointer(c_double, flags="C_CONTIGUOUS", ndim=3),
+]
 
 CAMB_GetBackgroundOutputs = camblib.__handles_MOD_camb_getbackgroundoutputs
 CAMB_GetBackgroundOutputs.argtypes = [POINTER(CAMBdata), numpy_1d, int_arg]

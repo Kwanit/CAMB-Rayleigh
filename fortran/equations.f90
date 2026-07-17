@@ -33,6 +33,7 @@
     use DarkEnergyInterface
     use RungeKuttaDP45Module, only : RungeKuttaDP45Settings
     use Transfer
+    use SourceWindows, only : Rayleigh_NumFreq ! added for Rayleigh scattering, single source of truth for num_cmb_freq
     implicit none
     public
 
@@ -115,6 +116,23 @@
         !True when using tight-coupling approximation (required for stability at early times)
         logical TightCoupling, TensTightCoupling
         real(dl) TightSwitchoffTime
+
+        !##################################################################
+        !######### feature added for Rayleigh scattering #############
+        !########## Stage 1 bookkeeping for the per-frequency photon
+        !########## hierarchy block (added in a later stage). Rayleigh is
+        !########## reset per-k in `initial` (never allowed to carry a
+        !########## stale value across k-modes); g_ix_freq/polind_freq/
+        !########## freq_neq are (re-)established on every call to
+        !########## SetupScalarArrayIndices, unconditionally whenever
+        !########## Rayleigh_NumFreq(CP%SourceTerms) > 0.
+        !##################################################################
+        logical Rayleigh
+        real(dl) RayleighSwitchOnTime
+        integer g_ix_freq, polind_freq, freq_neq
+        !###################################################################
+        !################ end of feature ########################
+        !###################################################################
 
         !Numer of scalar equations we are propagating
         integer ScalEqsToPropagate
@@ -340,6 +358,28 @@
             !TightCoupling
             EVout%TightCoupling=.false.
             EVout%TightSwitchoffTime = noSwitch
+            !##################################################################
+            !######### feature added for Rayleigh scattering #############
+            !########## Stage 3a: switch on the (still dynamics-free, Stage 3b)
+            !########## per-frequency block at exactly this moment -- safe to
+            !########## reuse this branch rather than adding a separate
+            !########## next_switch entry, since EV%RayleighSwitchOnTime was
+            !########## set equal to EV%TightSwitchoffTime in `initial` (Stage 1)
+            !########## and TightSwitchoffTime is not reassigned before this
+            !########## comparison, so next_switch==EV%TightSwitchoffTime IS
+            !########## next_switch==EV%RayleighSwitchOnTime here. This does
+            !########## NOT shift any array index: SetupScalarArrayIndices'
+            !########## Rayleigh block position depends only on num_cmb_freq
+            !########## (Stage 1), never on EV%Rayleigh, so the upcoming
+            !########## SetupScalarArrayIndices(EVout) call below lays out
+            !########## EVout exactly as it would have without this flag flip.
+            !########## (physics/logic oracle: camb_rayleigh_lewis/equations.f90:378-384,
+            !########## but WITHOUT its index-shift-on-switch-on -- see plan Section 4.2)
+            !##################################################################
+            if (Rayleigh_NumFreq(CP%SourceTerms) > 0) EVout%Rayleigh = .true.
+            !###################################################################
+            !################ end of feature ########################
+            !###################################################################
             call SetupScalarArrayIndices(EVout)
             call CopyScalarVariableArray(y,yout, EV, EVout)
             EV=EVout
@@ -589,6 +629,7 @@
     type(EvolutionVars) EV
     integer, intent(out), optional :: max_num_eqns
     integer neq, maxeq, nu_i
+    integer num_cmb_freq ! added for Rayleigh scattering, count of active frequency channels
     real(dl) nu_l_accuracy_boost
 
     neq=basic_num_eqns
@@ -615,6 +656,34 @@
         end if
     end if
     maxeq = maxeq +  (EV%lmaxg+1)+(EV%lmaxnr+1)+EV%lmaxgpol-1
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## Per-frequency photon temperature+polarization hierarchy
+    !########## block. Reserved AND propagated UNCONDITIONALLY whenever
+    !########## any Rayleigh frequency channels are configured (i.e.
+    !########## gated on the per-run num_cmb_freq count, never on the
+    !########## transient EV%Rayleigh switch) so the flat array index of
+    !########## everything declared below never shifts mid-k when
+    !########## EV%Rayleigh later turns on. This is the defensive design
+    !########## from the CAMB-Rayleigh port plan (Section 4.2/4.4):
+    !########## reserve for the Rayleigh-on case up front, never grow
+    !########## the array at switch-on.
+    !##################################################################
+    EV%g_ix_freq = 0
+    EV%polind_freq = 0
+    EV%freq_neq = 0
+    num_cmb_freq = Rayleigh_NumFreq(CP%SourceTerms)
+    if (num_cmb_freq > 0) then
+        EV%g_ix_freq = neq+1
+        EV%polind_freq = neq + (EV%lmaxg+1) - 1
+        EV%freq_neq = (EV%lmaxg+1) + (EV%lmaxgpol-1)
+        neq = neq + EV%freq_neq*num_cmb_freq
+        maxeq = maxeq + EV%freq_neq*num_cmb_freq
+    end if
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
 
     !Dark energy
     if (.not. CP%DarkEnergy%is_cosmological_constant) then
@@ -707,6 +776,7 @@
     integer lmax,i, nq
     integer nnueq,nu_i, ix_off, ix_off2, ind, ind2
     real(dl) q, pert_scale
+    integer num_cmb_freq ! added for Rayleigh scattering, per-frequency copy block below
 
     yout=0
     yout(1:basic_num_eqns) = y(1:basic_num_eqns)
@@ -727,6 +797,44 @@
             lmax = min(EV%lmaxgpol,EVout%lmaxgpol)
             yout(EVout%polind+2:EVout%polind+lmax)=y(EV%polind+2:EV%polind+lmax)
         end if
+
+        !##################################################################
+        !######### feature added for Rayleigh scattering #############
+        !########## Stage 3b fix: this block was missing entirely, which
+        !########## silently zeroed the whole per-frequency Rayleigh state
+        !########## (yout=0 at top of this routine) on every OTHER
+        !########## layout-changing switch that fires after EV%Rayleigh
+        !########## has turned on (e.g. tau_switch_nu_massless/_nonrel,
+        !########## tau_switch_ktau) -- any of those calls
+        !########## CopyScalarVariableArray too, and without this block the
+        !########## per-channel multipoles silently reset to 0 and then
+        !########## evolve forward from a wrong initial condition. Found by
+        !########## Stage 3b's 857GHz validation: the channel increment
+        !########## tracked Antony's almost exactly, then broke abruptly and
+        !########## permanently at one instant per k. Ported from the old
+        !########## branch's own copy, which already handles this correctly
+        !########## (camb_rayleigh_lewis/equations.f90:665-677) -- gated the
+        !########## same way it is there, on EV%Rayleigh .and. EVout%Rayleigh
+        !########## (not on the static num_cmb_freq count) since the source
+        !########## slots are only meaningfully populated once Rayleigh is on.
+        !##########
+        num_cmb_freq = Rayleigh_NumFreq(CP%SourceTerms)
+        if (EV%Rayleigh .and. EVout%Rayleigh) then
+            do i=1, num_cmb_freq
+                !assume number of frequencies is fixed
+                ix_off2 = EVOut%g_ix_freq + (i-1)*EVOut%freq_neq
+                ix_off = EV%g_ix_freq + (i-1)*EV%freq_neq
+                lmax = min(EV%lmaxg,EVout%lmaxg)
+                yout(ix_off2:ix_off2+lmax)=y(ix_off:ix_off+lmax)
+                lmax = min(EV%lmaxgpol,EVout%lmaxgpol)
+                ix_off2 = EVOut%polind_freq + (i-1)*EVOut%freq_neq
+                ix_off = EV%polind_freq + (i-1)*EV%freq_neq
+                yout(ix_off2+2:ix_off2+lmax)=y(ix_off+2:ix_off+lmax)
+            end do
+        end if
+        !###################################################################
+        !################ end of feature ########################
+        !###################################################################
     end if
 
     if (.not. EV%no_nu_multpoles .and. .not. EVout%no_nu_multpoles) then
@@ -1951,6 +2059,29 @@
     if (second_order_tightcoupling) ep=ep*2
     EV%TightSwitchoffTime = min(EV%ThermoData%tight_tau, EV%ThermoData%OpacityToTime(EV%k_buf/ep))
 
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## Per-k setup: compute when the (currently dormant) per-
+    !########## frequency hierarchy would switch on, mirroring
+    !########## TightSwitchoffTime just above (physics/logic oracle:
+    !########## camb_rayleigh_lewis/equations.f90:1801-1806), and
+    !########## explicitly reset EV%Rayleigh to .false. so a stale
+    !########## .true. from a previous k's EV can never persist here
+    !########## (plan Section 4.1). g_ix_freq/polind_freq/freq_neq are
+    !########## NOT reset here -- SetupScalarArrayIndices is their sole
+    !########## owner and has already (re-)established them correctly
+    !########## for this k, earlier in GaugeInterface_Init.
+    !##################################################################
+    if (Rayleigh_NumFreq(CP%SourceTerms) > 0) then
+        EV%RayleighSwitchOnTime = EV%TightSwitchoffTime
+    else
+        EV%RayleighSwitchOnTime = State%tau0+1 ! never switches on
+    end if
+    EV%Rayleigh = .false. ! reset per-k, was missing in an earlier abandoned port attempt (plan Section 4.1)
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
+
     y=0
 
     !  k*tau, (k*tau)**2, (k*tau)**3
@@ -2299,6 +2430,9 @@
     real(dl) a,a2,z,clxc,clxb,vb,clxg,qg,pig,clxr,qr,pir
     real(dl) E2, dopacity
     integer l,i,ind, ind2, off_ix, ix
+    integer num_cmb_freq ! added for Rayleigh scattering, count of active frequency channels
+    integer f_i ! added for Rayleigh scattering, per-frequency-channel loop index
+    real(dl) opac_rayleigh, opac_tot, E2_freq, polter_freq ! added for Rayleigh scattering
     real(dl) dgs,sigmadot,dz
     real(dl) dgpi,dgrho_matter,grho_matter, clxnu, gpres_nu
     !non-flat vars
@@ -2580,6 +2714,102 @@
             endif
         end if
     end if
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## Stage 3b: real per-channel photon temperature +
+    !########## E-polarization Boltzmann dynamics. Each channel's state
+    !########## variables are INCREMENTS relative to the primary
+    !########## (Delta = channel_full - primary), matching the old
+    !########## branch's own convention exactly -- re-derived directly
+    !########## from Antony's absolute-value equations (not just copied)
+    !########## to confirm this, e.g. the monopole has NO opacity term
+    !########## at all because isotropic scattering conserves photon
+    !########## number and the common metric source terms (z for
+    !########## monopole, 8/15*k*sigma for the quadrupole) are IDENTICAL
+    !########## for primary and full-channel equations and cancel
+    !########## exactly in the primary-minus-channel difference.
+    !########## Physics/logic oracle: camb_rayleigh_lewis/equations.f90:2445-2489.
+    !##########
+    !########## Defensive gate (stricter than the old branch): real
+    !########## dynamics require EV%Rayleigh (post-tight-coupling) AND
+    !########## .not. EV%no_phot_multpoles, since polter/E2/qg/pig (read
+    !########## below) are only freshly valid this call when the
+    !########## primary hierarchy itself is being evolved. The old
+    !########## branch nests its Rayleigh block one level higher (inside
+    !########## `if (.not. EV%no_phot_multpoles)` only), which works
+    !########## there because Rayleigh never switches on before tight
+    !########## coupling ends either -- but gating on both conditions
+    !########## explicitly here means the zero-fill else-branch (plan
+    !########## Section 4.4) still catches every other case unconditionally,
+    !########## rather than relying on that implication.
+    !##################################################################
+    num_cmb_freq = Rayleigh_NumFreq(CP%SourceTerms)
+    if (num_cmb_freq > 0) then
+        if (EV%Rayleigh .and. .not. EV%no_phot_multpoles) then
+            do f_i=1, num_cmb_freq
+                opac_rayleigh = CP%Recomb%Recombination_rayleigh_eff(a)*State%akthom/a2 * &
+                    Rayleigh_OpacityFactor(CP%SourceTerms%rayleigh_frequencies(f_i), a)
+                opac_tot = opac_rayleigh + opacity
+                ind = EV%g_ix_freq + (f_i-1)*EV%freq_neq
+
+                ! monopole (increment): pure continuity, no collision term (camb_rayleigh_lewis/equations.f90:2450)
+                ayprime(ind) = -k*ay(ind+1)
+
+                ! dipole (increment): old branch writes the collision term as
+                ! 4/3*photbar*(-opacity(1)*Delta_qg + opac_rayleigh*(4/3vb-qg-Delta_qg))/pb43;
+                ! 4/3*photbar/pb43 = 1 exactly (pb43 is defined as 4/3*photbar), so this
+                ! simplifies to -opac_tot*Delta_qg + opac_rayleigh*(4/3vb-qg) (camb_rayleigh_lewis/equations.f90:2451-2452)
+                ayprime(ind+1) = EV%denlk(1)*ay(ind) - EV%denlk2(1)*ay(ind+2) &
+                    + opac_rayleigh*(4._dl/3*vb-qg) - opac_tot*ay(ind+1)
+
+                E2_freq = ay(EV%polind_freq + (f_i-1)*EV%freq_neq + 2)
+                polter_freq = ay(ind+2)/10 + 9._dl/15*E2_freq !channel's own increment polter
+
+                ix = ind+2
+                if (EV%lmaxg>2) then
+                    ayprime(ix) = EV%denlk(2)*ay(ind+1) - EV%denlk2(2)*ay(ix+1) - opac_tot*(ay(ix)-polter_freq) &
+                        - opac_rayleigh*(pig - polter)
+                    do l=3,EV%lmaxg-1
+                        ix=ix+1
+                        ayprime(ix) = (EV%denlk(l)*ay(ix-1)-EV%denlk2(l)*ay(ix+1)) - opac_tot*ay(ix) &
+                            - opac_rayleigh*ay(EV%g_ix+l)
+                    end do
+                    ix=ix+1
+                    !truncate the photon moment expansion
+                    ayprime(ix) = k*ay(ix-1) - (EV%lmaxg+1)*cothxor*ay(ix) - opac_tot*ay(ix) &
+                        - opac_rayleigh*ay(EV%g_ix+EV%lmaxg)
+                else !closed case
+                    ayprime(ix) = EV%denlk(2)*ay(ind+1) - opac_tot*(ay(ix)-polter_freq) - opac_rayleigh*(pig-polter)
+                end if
+
+                !polarization, l=2
+                ix = EV%polind_freq + (f_i-1)*EV%freq_neq + 2
+                if (EV%lmaxgpol>2) then
+                    ayprime(ix) = -opac_tot*(ay(ix)-polter_freq) - k/3._dl*ay(ix+1) &
+                        - opac_rayleigh*(ay(EV%polind+2)-polter)
+                    do l=3,EV%lmaxgpol-1
+                        ix=ix+1
+                        ayprime(ix) = -opac_tot*ay(ix) - opac_rayleigh*ay(EV%polind+l) &
+                            + (EV%denlk(l)*ay(ix-1)-EV%polfack(l)*ay(ix+1))
+                    end do
+                    ix=ix+1
+                    !truncate
+                    ayprime(ix) = -opac_tot*ay(ix) - opac_rayleigh*ay(EV%polind+EV%lmaxgpol) + &
+                        k*EV%poltruncfac*ay(ix-1) - (EV%lmaxgpol+3)*cothxor*ay(ix)
+                else !closed case
+                    ayprime(ix) = -opac_tot*(ay(ix)-polter_freq) - opac_rayleigh*ay(EV%polind+2)
+                end if
+            end do
+        else
+            ! per-k reset in `initial` starts EV%Rayleigh false, and no_phot_multpoles can
+            ! turn on later even after Rayleigh does -- zero-fill catches both, plan Section 4.4
+            ayprime(EV%g_ix_freq : EV%g_ix_freq + EV%freq_neq*num_cmb_freq - 1) = 0
+        end if
+    end if
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
 
     if (.not. EV%no_nu_multpoles) then
         !  Massless neutrino equations of motion.
