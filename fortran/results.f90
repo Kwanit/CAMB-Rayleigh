@@ -3163,9 +3163,14 @@
             allocate(this%Cl_scalar(CP%Min_l:CP%Max_l, C_Temp:State%Scalar_C_last), source=0._dl)
             if (CP%want_cl_2D_array) then
                 if (allocated(this%Cl_scalar_array)) deallocate(this%Cl_scalar_array)
+                ! feature added for Rayleigh scattering, Stage 5: sized to also hold the
+                ! Rayleigh T,E difference-source tail columns (2 per channel), appended
+                ! after custom sources -- see equations.f90 output() banner for the layout
                 allocate(this%Cl_scalar_Array(CP%Min_l:CP%Max_l, &
-                    3+State%num_redshiftwindows+CP%CustomSources%num_custom_sources, &
-                    3+State%num_redshiftwindows+CP%CustomSources%num_custom_sources))
+                    3+State%num_redshiftwindows+CP%CustomSources%num_custom_sources &
+                    +2*Rayleigh_NumFreq(CP%SourceTerms), &
+                    3+State%num_redshiftwindows+CP%CustomSources%num_custom_sources &
+                    +2*Rayleigh_NumFreq(CP%SourceTerms)))
                 this%Cl_scalar_array = 0
             end if
         end if

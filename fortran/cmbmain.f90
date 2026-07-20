@@ -754,7 +754,21 @@
     integer :: err
 
     if (CP%WantScalars) then
-        if (WantLateTime) then
+        !##########################################################################
+        !######### feature added for Rayleigh scattering #############
+        !### Stage 5: force the 3-column (T,E,phi) start whenever Rayleigh is
+        !### active, even if lensing/windows/customsources are all off. This is
+        !### required, not cosmetic: CalcScalCls/InterpolateCls/TCLdata_InitCls
+        !### all use "NumSources>2" pervasively as a proxy for "column 3 is the
+        !### lensing-potential source" -- without this, turning on Rayleigh with
+        !### DoLensing=F would make NumSources>2 true via Rayleigh's own tail
+        !### columns alone, and column 3 would silently be Rayleigh channel 1's
+        !### T source instead of phi, corrupting that pre-existing equivalence.
+        !### The reserved phi column is otherwise harmless: CP%DoLensing (a
+        !### separate, later flag) still controls whether lensing is actually
+        !### applied (lens_Cls), so this does not lens anything.
+        !##########################################################################
+        if (WantLateTime .or. Rayleigh_NumFreq(CP%SourceTerms) > 0) then
             ThisSources%SourceNum=3
             State%Scalar_C_last = C_PhiE
             ThisSources%NonCustomSourceNum=ThisSources%SourceNum + State%num_redshiftwindows + &
@@ -765,6 +779,11 @@
             ThisSources%NonCustomSourceNum = ThisSources%SourceNum
             State%Scalar_C_last = C_Cross
         end if
+        ! Rayleigh: append 2 columns (T,E difference-from-primary source) per
+        ! frequency channel at the tail, after any custom sources -- purely
+        ! additive, see equations.f90 output() banner for the layout rationale.
+        ThisSources%SourceNum = ThisSources%SourceNum + 2*Rayleigh_NumFreq(CP%SourceTerms)
+        !######### end of feature #########
     else
         ThisSources%SourceNum=3
         ThisSources%NonCustomSourceNum = ThisSources%SourceNum
@@ -1200,6 +1219,7 @@
     real(dl) scaling(State%num_transfer_redshifts), ddScaling(State%num_transfer_redshifts)
     real(dl) ho,a0,b0, ascale
     integer tf_lo, tf_hi
+    integer :: nonlinear_src_end ! added for Rayleigh scattering, Stage 5 (see banner below)
 
     if (allocated(State%CAMB_Pk)) deallocate(State%CAMB_PK)
     allocate(State%CAMB_PK)
@@ -1212,11 +1232,19 @@
     end do
     allocate(ScaledSrc, source = ThisSources%LinearSrc)
 
+    ! feature added for Rayleigh scattering, Stage 5: Rayleigh's T,E difference
+    ! columns are linear, recombination-era quantities (structurally identical to
+    ! primary T,E, which the pre-existing "3:"/"4:" slices below already exclude
+    ! by starting at 3/4) -- NOT tracers of non-linear matter clustering like
+    ! lensing/window sources are, so they must be excluded from this rescaling.
+    ! nonlinear_src_end is the column one-past the last non-Rayleigh source.
+    nonlinear_src_end = ThisSources%SourceNum - 2*Rayleigh_NumFreq(CP%SourceTerms)
+
     !$OMP PARALLEL DO DEFAULT(SHARED), SCHEDULE(STATIC), &
     !$OMP & PRIVATE(i, scaling, ddScaling, tf_lo, tf_hi, tau, ho, a0, b0, ascale)
     do ik=1, ThisSources%Evolve_q%npoints
         if (CP%Do21cm) then
-            ScaledSrc(ik, 4:, :) = ScaledSrc(ik, 4:, :) * State%CAMB_Pk%nonlin_ratio(ik,1)
+            ScaledSrc(ik, 4:nonlinear_src_end, :) = ScaledSrc(ik, 4:nonlinear_src_end, :) * State%CAMB_Pk%nonlin_ratio(ik,1)
         elseif (ThisSources%Evolve_q%points(ik)/(CP%H0/100) >  CP%NonLinearModel%Min_kh_nonlinear) then
             !Interpolate non-linear scaling in conformal time
             !Do not use an associate for scaling. It does not work.
@@ -1243,7 +1271,7 @@
                     ((a0**3-a0)* ddscaling(tf_lo) &
                     +(b0**3-b0)*ddscaling(tf_hi))*ho**2/6
 
-                ScaledSrc(ik,3:,i) = ScaledSrc(ik,3:,i) * ascale
+                ScaledSrc(ik,3:nonlinear_src_end,i) = ScaledSrc(ik,3:nonlinear_src_end,i) * ascale
             end  do
         end if
     end do
@@ -1663,11 +1691,19 @@
     integer bes_ix,n, bes_index(IV%SourceSteps)
     integer custom_source_off, s_ix
     integer nwin
+    integer :: num_cmb_freq_local, rayleigh_source_off ! added for Rayleigh scattering, Stage 5
     real(dl) :: BessIntBoost, BessIntBoostL, source_window_tail_lmax
     logical :: has_narrow_source_window
 
     BessIntBoost = CP%Accuracy%AccuracyBoost*CP%Accuracy%BessIntBoost
     custom_source_off = State%num_redshiftwindows + State%num_extra_redshiftwindows + 4
+    ! feature added for Rayleigh scattering, Stage 5: Rayleigh's 2*num_cmb_freq T,E
+    ! columns sit at the tail, after custom sources -- rayleigh_source_off is one
+    ! past the last custom source (or one past windows if there are none), mirroring
+    ! custom_source_off's own forward-computed-from-State idiom.
+    num_cmb_freq_local = Rayleigh_NumFreq(CP%SourceTerms)
+    rayleigh_source_off = State%num_redshiftwindows + State%num_extra_redshiftwindows + 4 &
+        + CP%CustomSources%num_custom_sources
     has_narrow_source_window = .false.
     source_window_tail_lmax = 0._dl
     if (State%num_redshiftwindows > 0 .and. CP%WantScalars) then
@@ -1753,7 +1789,8 @@
             !Do integral if any useful contribution to the CMB, or large scale effects
 
             if (DoInt) then
-                if (CP%CustomSources%num_custom_sources==0 .and. State%num_redshiftwindows==0) then
+                if (CP%CustomSources%num_custom_sources==0 .and. State%num_redshiftwindows==0 &
+                    .and. num_cmb_freq_local==0) then
                     do n= State%TimeSteps%IndexOf(tmin),min(IV%SourceSteps,State%TimeSteps%IndexOf(tmax))
                         !Full Bessel integration
                         a2=left_weight(n)
@@ -1777,7 +1814,7 @@
                     else
                         nwin = State%TimeSteps%npoints+1
                     end if
-                    if (CP%CustomSources%num_custom_sources==0) then
+                    if (CP%CustomSources%num_custom_sources==0 .and. num_cmb_freq_local==0) then
                         do n= State%TimeSteps%IndexOf(tmin),min(IV%SourceSteps,State%TimeSteps%IndexOf(tmax))
                             !Full Bessel integration
                             a2=left_weight(n)
@@ -1817,7 +1854,9 @@
                             sums(1) = sums(1) + IV%Source_q(n,1)*J_l
                             sums(2) = sums(2) + IV%Source_q(n,2)*J_l
                             sums(3) = sums(3) + IV%Source_q(n,3)*J_l
-                            sums(custom_source_off) = sums(custom_source_off) +  IV%Source_q(n,custom_source_off)*J_l
+                            if (CP%CustomSources%num_custom_sources>0) then
+                                sums(custom_source_off) = sums(custom_source_off) +  IV%Source_q(n,custom_source_off)*J_l
+                            end if
                             if (n >= nwin) then
                                 do s_ix = 4, ThisSources%NonCustomSourceNum
                                     sums(s_ix) = sums(s_ix) + IV%Source_q(n,s_ix)*J_l
@@ -1826,6 +1865,17 @@
                             do s_ix = custom_source_off+1, custom_source_off+CP%CustomSources%num_custom_sources -1
                                 sums(s_ix) = sums(s_ix)  + IV%Source_q(n,s_ix)*J_l
                             end do
+                            ! feature added for Rayleigh scattering, Stage 5: Rayleigh's T,E
+                            ! difference columns need the SAME unconditional full-tau-range
+                            ! treatment as custom sources (never gated by nwin, which is a
+                            ! late-time-only cutoff meaningless for recombination-era sources)
+                            ! -- and are NEVER routed through Limber (see UseLimber call sites,
+                            ! all hardcoded to column 3 only, never touching this range).
+                            if (num_cmb_freq_local > 0) then
+                                do s_ix = rayleigh_source_off, rayleigh_source_off+2*num_cmb_freq_local-1
+                                    sums(s_ix) = sums(s_ix) + IV%Source_q(n,s_ix)*J_l
+                                end do
+                            end if
                         end do
                     end if
                 end if
@@ -3208,9 +3258,14 @@
     real(dl) apowers
     real(dl) dlnk, ell, ctnorm, dbletmp, Delta1, Delta2
     real(dl), allocatable :: ks(:), dlnks(:), pows(:)
-    real(dl) fac(3 + State%num_redshiftwindows + State%CP%CustomSources%num_custom_sources)
+    ! feature added for Rayleigh scattering, Stage 5: fac(:)/iCl_Array(:) grown by
+    ! 2*num_cmb_freq to cover the Rayleigh T,E difference-source tail columns
+    integer :: num_cmb_freq
+    real(dl) fac(3 + State%num_redshiftwindows + CP%CustomSources%num_custom_sources &
+        + 2*Rayleigh_NumFreq(CP%SourceTerms))
     integer nscal, i
 
+    num_cmb_freq = Rayleigh_NumFreq(CP%SourceTerms)
     allocate(ks(CTrans%q%npoints),dlnks(CTrans%q%npoints), pows(CTrans%q%npoints))
     do q_ix = 1, CTrans%q%npoints
         if (State%flat) then
@@ -3286,21 +3341,31 @@
                                 iCl_Array(j,w_ix,w_ix2) = iCl_Array(j,w_ix,w_ix2)+Delta1*Delta2*apowers*dlnk
                             end do
                         end do
-                        if (CP%CustomSources%num_custom_sources >0) then
-                            do w_ix=1,3 + State%num_redshiftwindows + CP%CustomSources%num_custom_sources
+                        ! feature added for Rayleigh scattering, Stage 5: the bound below was
+                        ! originally "3+nrw+ncustom" (custom sources only); widening it to also
+                        ! include Rayleigh's tail columns is sufficient on its own -- for any
+                        ! w_ix beyond windows (w_ix > 3+nrw), the physical Delta_p_l_k index is
+                        ! always "w_ix+num_extra_redshiftwindows" regardless of whether w_ix
+                        ! lands in the custom-sources or Rayleigh sub-range, since Rayleigh sits
+                        ! contiguously right after custom sources with the same hidden-window
+                        ! offset. See equations.f90 output() banner for the column layout.
+                        if (CP%CustomSources%num_custom_sources > 0 .or. num_cmb_freq > 0) then
+                            do w_ix=1,3 + State%num_redshiftwindows + CP%CustomSources%num_custom_sources &
+                                + 2*num_cmb_freq
                                 if (w_ix > 3 + State%num_redshiftwindows) then
                                     Delta1= CTrans%Delta_p_l_k(w_ix+State%num_extra_redshiftwindows,j,q_ix)
                                 else
                                     Delta1= CTrans%Delta_p_l_k(w_ix,j,q_ix)
                                 end if
                                 do w_ix2=max(w_ix,3 + State%num_redshiftwindows +1), &
-                                    3 + State%num_redshiftwindows +CP%CustomSources%num_custom_sources
+                                    3 + State%num_redshiftwindows +CP%CustomSources%num_custom_sources + 2*num_cmb_freq
                                     Delta2=  CTrans%Delta_p_l_k(w_ix2+State%num_extra_redshiftwindows,j,q_ix)
                                     iCl_Array(j,w_ix,w_ix2) = iCl_Array(j,w_ix,w_ix2) &
                                         +Delta1*Delta2*apowers*dlnk
                                 end do
                             end do
                         end if
+                        !######### end of feature #########
                     end if
 
                     if (CTrans%NumSources>2 ) then
@@ -3334,6 +3399,15 @@
                     end do
                     fac(w_ix) = sqrt(fac(w_ix))
                 end do
+                ! feature added for Rayleigh scattering, Stage 5: each channel's T column
+                ! keeps the default fac=1 (same normalization as primary T); each channel's
+                ! E column gets sqrt(ctnorm), identical to primary E's fac(2) above -- this
+                ! is NOT the generic custom_source_ell_scales formula (Rayleigh sources are
+                ! computed directly, not via the symbolic custom-source pipeline).
+                do i=1, num_cmb_freq
+                    fac(3 + State%num_redshiftwindows + CP%CustomSources%num_custom_sources + 2*i) = sqrt(ctnorm)
+                end do
+                !######### end of feature #########
             end if
 
             do w_ix=1, CTrans%NumSources - State%num_extra_redshiftwindows
@@ -3560,8 +3634,12 @@
             end do
 
             if (State%CLdata%CTransScal%NumSources>2 .and. State%CP%want_cl_2D_array) then
-                do i=1,3+State%num_redshiftwindows + CP%CustomSources%num_custom_sources
-                    do j=i,3+State%num_redshiftwindows + CP%CustomSources%num_custom_sources
+                ! feature added for Rayleigh scattering, Stage 5: bound widened by
+                ! 2*num_cmb_freq to also interpolate the Rayleigh tail columns
+                do i=1,3+State%num_redshiftwindows + CP%CustomSources%num_custom_sources &
+                    + 2*Rayleigh_NumFreq(CP%SourceTerms)
+                    do j=i,3+State%num_redshiftwindows + CP%CustomSources%num_custom_sources &
+                        + 2*Rayleigh_NumFreq(CP%SourceTerms)
                         if (i<3 .and. j<3) then
                             State%CLData%Cl_scalar_array(:,i,j) = State%CLData%Cl_scalar(:, ind(i,j))
                         else

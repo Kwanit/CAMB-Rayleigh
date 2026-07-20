@@ -660,6 +660,59 @@
 
     end subroutine CAMB_SetUnlensedScalarArray
 
+    !##########################################################################
+    !######### feature added for Rayleigh scattering #############
+    !### Stage 5: export just the primary T,E and per-frequency Rayleigh
+    !### channel T,E difference-source cross-spectra, without requiring the
+    !### caller to know about (or pay the cost of transferring) any lensing
+    !### potential/redshift-window/custom-source columns that may also be
+    !### present in Data%CLData%Cl_scalar_array's actual physical layout in
+    !### between. Reads straight from the array's own runtime size (n_full =
+    !### size(...,2)) rather than recomputing the windows/customsources
+    !### bookkeeping here, so this can never drift out of sync with however
+    !### GetSourceMem/TCLdata_InitCls actually laid the array out.
+    !###
+    !### RayleighArray(i,j,l) for i,j = 1..2+2*num_cmb_freq:
+    !###   1 = primary T, 2 = primary E,
+    !###   2+2*(c-1)+1 = channel c's T difference source (c=1..num_cmb_freq)
+    !###   2+2*(c-1)+2 = channel c's E difference source
+    !### (all entries except [1,1],[1,2],[2,1],[2,2] are difference spectra;
+    !### reconstructing totals is a Python-side convenience, not done here)
+    !##########################################################################
+    subroutine CAMB_SetRayleighScalarArray(Data,lmax, RayleighArray, num_cmb_freq)
+    Type(CAMBdata) :: Data
+    integer, intent(IN) :: lmax, num_cmb_freq
+    real(dl), intent(OUT) :: RayleighArray(2+2*num_cmb_freq, 2+2*num_cmb_freq, 0:lmax)
+    integer l, n_full, n_out, i, j, pi, pj
+
+    RayleighArray = 0
+    if (Data%CP%WantScalars .and. num_cmb_freq>0 .and. allocated(Data%CLData%Cl_scalar_array)) then
+        n_full = size(Data%CLData%Cl_scalar_array, 2)
+        n_out = 2+2*num_cmb_freq
+        do l=Data%CP%Min_l, min(lmax,Data%CP%Max_l)
+            do i=1,n_out
+                if (i<=2) then
+                    pi = i
+                else
+                    pi = n_full - 2*num_cmb_freq + i - 2
+                end if
+                do j=1,n_out
+                    if (j<=2) then
+                        pj = j
+                    else
+                        pj = n_full - 2*num_cmb_freq + j - 2
+                    end if
+                    RayleighArray(i,j,l) = Data%CLData%Cl_scalar_array(l,pi,pj)
+                end do
+            end do
+        end do
+    end if
+
+    end subroutine CAMB_SetRayleighScalarArray
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
+
     subroutine CAMB_GetBackgroundOutputs(Data,outputs, n)
     use constants
     Type(CAMBdata) :: Data
@@ -895,6 +948,110 @@
         if (global_error_flag/=0) return
     end do
     end subroutine GetRayleighMultipoleEvolutionFork
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## Stage 4: validation-only per-frequency T/E source
+    !########## accessor, mirroring CAMB_RayleighMultipoleEvolution /
+    !########## GetRayleighMultipoleEvolutionFork (Stage 3b) above, which
+    !########## itself mirrors CAMB_TimeEvolution / GetOutputEvolutionFork.
+    !########## Sources are a side effect of calling derivs with
+    !########## EV%OutputSources/OutputSourcesFreq associated (see
+    !########## GetOutputEvolutionFork's own EV%OutputSources => sources
+    !########## pattern above) rather than something read directly off the
+    !########## state vector, so this calls derivs once explicitly after
+    !########## each GaugeInterface_EvolveScal step, exactly as
+    !########## GetOutputEvolutionFork does for the primary-only case.
+    !##################################################################
+    function CAMB_RayleighSourceEvolution(this, nq, q, ntimes, times, freq_index, noutputs, outputs) result(err)
+    use GaugeInterface
+    use CAMBmain
+    Type(CAMBdata), target :: this
+    integer, intent(in) :: nq, ntimes, freq_index, noutputs
+    real(dl), intent(in) :: q(nq), times(ntimes)
+    real(dl), intent(out) :: outputs(noutputs, ntimes, nq)
+    integer err, q_ix
+    real(dl) taustart
+    Type(EvolutionVars) :: EV
+
+    call SetActiveState(this)
+    global_error_flag = 0
+    outputs = 0
+    taustart = min(times(1),GetTauStart(maxval(q)))
+    if (.not. this%ThermoData%HasTHermoData .or. taustart < this%ThermoData%tauminn) call this%ThermoData%Init(this,taustart)
+    !$OMP PARALLEL DO DEFAUlT(SHARED),SCHEDUlE(DYNAMIC), PRIVATE(EV, q_ix)
+    do q_ix= 1, nq
+        if (global_error_flag==0) then
+            EV%q_ix = q_ix
+            EV%q = q(q_ix)
+            EV%TransferOnly=.false.
+            EV%q2=EV%q**2
+            EV%ThermoData => this%ThermoData
+            call GetNumEqns(EV)
+            call GetRayleighSourceEvolutionFork(EV, times, freq_index, outputs(:,:,q_ix))
+        end if
+    end do
+    !$OMP END PARALLEL DO
+    err = global_error_flag
+    end function CAMB_RayleighSourceEvolution
+
+    subroutine GetRayleighSourceEvolutionFork(EV, times, freq_index, outputs)
+    use CAMBmain
+    type(EvolutionVars) EV
+    real(dl), intent(in) :: times(:)
+    integer, intent(in) :: freq_index
+    real(dl), intent(out) :: outputs(:,:)
+    ! outputs rows: 1=Rayleigh flag(0/1), 2=primary T source, 3=primary E source,
+    ! 4=channel DIFF T source (channel-primary), 5=channel DIFF E source,
+    ! 6=channel ISW group, 7=channel monopole group, 8=channel doppler group,
+    ! 9=channel quadrupole group (6-9 are RAW/absolute, not differenced -- source
+    ! decomposition plot only, see EV%OutputSourcesFreq's own layout comment)
+    real(dl) tau,tol1,tauend, taustart
+    integer j,ind, num_cmb_freq
+    type(RungeKuttaDP45Settings) :: rk_settings
+    real(dl) w(EV%nvar,9), y(EV%nvar), yprime(EV%nvar)
+    real(dl), target :: local_sources(2)
+    real(dl), target, allocatable :: local_sourcesFreq(:)
+    procedure(obj_function) :: dtauda
+
+    w=0
+    y=0
+    outputs=0
+    num_cmb_freq = Rayleigh_NumFreq(CP%SourceTerms)
+    if (num_cmb_freq > 0) allocate(local_sourcesFreq(6*num_cmb_freq))
+    taustart = GetTauStart(min(500._dl,EV%q))
+    call initial(EV,y, taustart)
+
+    tau=taustart
+    ind=1
+    tol1=base_tol/exp(CP%Accuracy%AccuracyBoost*CP%Accuracy%IntTolBoost-1)
+    do j=1,size(times)
+        tauend = times(j)
+        if (tauend<taustart) cycle
+
+        call GaugeInterface_EvolveScal(EV, tau, y, tauend, tol1, ind, rk_settings, w)
+        yprime = 0
+        EV%OutputSources => local_sources
+        if (num_cmb_freq > 0) EV%OutputSourcesFreq => local_sourcesFreq
+        call derivs(EV,EV%ScalEqsToPropagate,tau,y,yprime)
+        nullify(EV%OutputSources, EV%OutputSourcesFreq)
+
+        outputs(1,j) = merge(1._dl, 0._dl, EV%Rayleigh)
+        outputs(2,j) = local_sources(1)
+        outputs(3,j) = local_sources(2)
+        if (num_cmb_freq > 0 .and. freq_index>=1 .and. freq_index<=num_cmb_freq) then
+            outputs(4,j) = local_sourcesFreq(6*(freq_index-1)+1)
+            outputs(5,j) = local_sourcesFreq(6*(freq_index-1)+2)
+            outputs(6,j) = local_sourcesFreq(6*(freq_index-1)+3)
+            outputs(7,j) = local_sourcesFreq(6*(freq_index-1)+4)
+            outputs(8,j) = local_sourcesFreq(6*(freq_index-1)+5)
+            outputs(9,j) = local_sourcesFreq(6*(freq_index-1)+6)
+        end if
+
+        if (global_error_flag/=0) return
+    end do
+    if (allocated(local_sourcesFreq)) deallocate(local_sourcesFreq)
+    end subroutine GetRayleighSourceEvolutionFork
     !###################################################################
     !################ end of feature ########################
     !###################################################################

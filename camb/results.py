@@ -784,6 +784,75 @@ class CAMBdata(F2003Class):
     # ################ end of feature ########################
     # ###################################################################
 
+    # ##################################################################
+    # ######### feature added for Rayleigh scattering #############
+    # ########## Stage 4 validation-only accessor: per-frequency-channel
+    # ########## T/E line-of-sight source functions vs conformal time. Not
+    # ########## part of the final Cl-output API (Stage 5) -- exists purely
+    # ########## to validate the Stage 4 source assembly against Antony.
+    # ##################################################################
+    def get_rayleigh_source_evolution(self, q, eta: np.ndarray, freq_index: int = 1) -> dict[str, np.ndarray]:
+        """
+        Get the temperature (T) and E-polarization line-of-sight source functions vs
+        conformal time, for the primary channel (absolute) and one Rayleigh frequency
+        channel (stored as a difference from the primary, matching the Fortran side's
+        numerical-stability convention -- add 'primary_T'/'primary_E' back to reconstruct
+        the channel's own absolute source).
+
+        :param q: wavenumber (scalar or array)
+        :param eta: array of requested conformal times to output
+        :param freq_index: 1-based index into SourceTerms.rayleigh_frequencies for the
+            channel to report
+        :return: dict with keys 'rayleigh_on' (0/1), 'primary_T', 'primary_E',
+            'diff_T', 'diff_E', and the channel's raw (absolute, not differenced)
+            phi-free source groups 'isw_T', 'monopole_T', 'doppler_T', 'quadrupole_T'
+            (their sum is the channel's own absolute T source); each n_q x n_eta
+            (or n_eta if q scalar)
+        """
+        scalar_q = np.isscalar(q)
+        k = np.array([q], dtype=np.float64) if scalar_q else np.ascontiguousarray(q, dtype=np.float64)
+        times = np.asarray(np.atleast_1d(eta), dtype=np.float64)
+        # sort/un-sort for the ODE integrator, mirroring get_rayleigh_multipole_evolution
+        indices = np.argsort(times)
+        i_rev = np.zeros(times.shape, dtype=int)
+        i_rev[indices] = np.arange(times.shape[0])
+        noutputs = 9
+        # reversed (nq, ntimes, noutputs) numpy shape vs Fortran's (noutputs, ntimes, nq),
+        # mirroring get_rayleigh_multipole_evolution's own confirmed-correct convention
+        outputs = np.zeros((k.shape[0], times.shape[0], noutputs))
+        err = CAMB_RayleighSourceEvolution(
+            byref(self),
+            byref(c_int(k.shape[0])),
+            k,
+            byref(c_int(times.shape[0])),
+            times[indices],
+            byref(c_int(freq_index)),
+            byref(c_int(noutputs)),
+            outputs,
+        )
+        if err:
+            raise CAMBError("Error in get_rayleigh_source_evolution")
+        outputs = outputs[:, i_rev, :]
+        names = [
+            "rayleigh_on",
+            "primary_T",
+            "primary_E",
+            "diff_T",
+            "diff_E",
+            "isw_T",
+            "monopole_T",
+            "doppler_T",
+            "quadrupole_T",
+        ]
+        result = {}
+        for i, name in enumerate(names):
+            arr = outputs[:, :, i]  # (n_q, n_eta)
+            result[name] = arr[0] if scalar_q else arr
+        return result
+    # ###################################################################
+    # ################ end of feature ########################
+    # ###################################################################
+
     @overload
     def get_background_densities(self, a: float, vars=model.density_names, format="dict") -> dict | np.ndarray: ...
 
@@ -1455,6 +1524,114 @@ class CAMBdata(F2003Class):
                 params.Want_cl_2D_array = old_val
         return result
 
+    # ##########################################################################
+    # ######### feature added for Rayleigh scattering #############
+    # ### Stage 5: per-frequency Rayleigh-scattering C_ell, exposed as either
+    # ### the raw full covariance array or a frequency-keyed dict.
+    # ##########################################################################
+    def get_rayleigh_cls(self, lmax=None, CMB_unit=None, raw_cl=False, as_dict=False, total=False):
+        r"""
+        Get the full covariance of unlensed primary and per-frequency Rayleigh-scattering
+        C_ell, for every channel pair, both orderings. Must have already calculated power
+        spectra with :attr:`.model.CAMBparams.SourceTerms.rayleigh_scattering` set.
+
+        Everything here is **unlensed** (including the primary): the Rayleigh channels are
+        computed unlensed, so mixing a lensed primary with unlensed Rayleigh channels would
+        be physically inconsistent. Lensing of these spectra is not implemented yet.
+
+        Channel 0 is the primary; channels 1..N follow the order of
+        :attr:`.model.SourceTermParams.rayleigh_frequencies`. By default (``total=False``)
+        the values are DIFFERENCE spectra from the primary -- i.e. for i>0,
+        arr[0,i] is :math:`C_\ell^{T,\,dT_i}` (primary T against channel i's T MINUS
+        primary T source), and for i,j>0, arr[i,j] is :math:`C_\ell^{dT_i,\,dT_j}` --
+        except arr[0,0], which is the ordinary primary unlensed auto-spectrum (never a
+        difference). This is the quantity validated directly against the reference
+        implementation.
+
+        The returned array (or dict) is the FULL n_ch x n_ch matrix: arr[i,j] and arr[j,i]
+        are both populated and are **not** equal in general -- for the mixed TE spectrum,
+        :math:`C_\ell^{T_i,E_j} \neq C_\ell^{T_j,E_i}` because temperature is taken from one
+        channel and polarization from the other. TT, EE (and BB, always zero here since this
+        is scalars-only) are symmetric under i<->j; only TE differs by ordering. Storing only
+        a triangle would silently discard that TE/ET distinction.
+
+        :param lmax: maximum :math:`\ell`
+        :param CMB_unit: scale results from dimensionless. Use 'muK' for :math:`\mu K^2` units.
+        :param raw_cl: return :math:`C_\ell` rather than :math:`\ell(\ell+1)C_\ell/2\pi`
+        :param as_dict: if True, return a dict keyed by ``(freq_i, freq_j)`` GHz-band pairs
+          (0 for the primary) instead of the raw array -- see below.
+        :param total: if True, reconstruct the physical TOTAL cross-spectra per pair
+          (:math:`C_\ell^{T_i,T_j} = C_\ell^{TT} + C_\ell^{T,dT_i} + C_\ell^{T,dT_j} +
+          C_\ell^{dT_i,dT_j}`, and the analogous combination respecting ordering for the
+          mixed TE case), reconstructed in Python from the stored difference spectra --
+          no extra Fortran computation. The primary used in the reconstruction is the
+          unlensed primary. Default is False (the validated, difference-based quantity).
+        :return: if ``as_dict`` is False (default), a numpy array of shape
+          ``(n_ch, n_ch, lmax+1, 4)`` indexed ``[channel_i, channel_j, ell, spectrum]``
+          with n_ch = num_cmb_freq+1 and the last axis TT, EE, BB, TE (BB is always zero).
+          If ``as_dict`` is True, a dict mapping ``(freq_i, freq_j)`` (int GHz, 0=primary)
+          to a ``(lmax+1, 4)`` array in the same TT,EE,BB,TE column order; both orderings
+          are included as separate keys (e.g. ``d[(217, 857)]`` and ``d[(857, 217)]`` are
+          both present, equal in TT/EE/BB, and differ in the TE column).
+        """
+
+        rayleigh_freqs = list(self.Params.SourceTerms.rayleigh_frequencies)
+        num_cmb_freq = len(rayleigh_freqs)
+        if num_cmb_freq == 0:
+            raise CAMBError("get_rayleigh_cls: no SourceTerms.rayleigh_frequencies configured")
+
+        lmax = self._lmax_setting(lmax, unlensed=True)
+        n_raw = 2 + 2 * num_cmb_freq
+        raw = np.empty((n_raw, n_raw, lmax + 1), order="F")
+        CAMB_SetRayleighScalarArray(byref(self), byref(c_int(lmax)), raw, byref(c_int(num_cmb_freq)))
+
+        # raw index convention (0-based): 0=primary T, 1=primary E, then per
+        # channel c=1..num_cmb_freq: 2+2*(c-1)=T, 2+2*(c-1)+1=E (see camb_python.f90
+        # CAMB_SetRayleighScalarArray banner for the Fortran-side layout this mirrors)
+        n_ch = num_cmb_freq + 1
+        t_idx = [0] + [2 + 2 * (c - 1) for c in range(1, n_ch)]
+        e_idx = [1] + [2 + 2 * (c - 1) + 1 for c in range(1, n_ch)]
+
+        arr = np.zeros((n_ch, n_ch, lmax + 1, 4))
+        for ci in range(n_ch):
+            for cj in range(n_ch):
+                arr[ci, cj, :, 0] = raw[t_idx[ci], t_idx[cj], :]  # TT
+                arr[ci, cj, :, 1] = raw[e_idx[ci], e_idx[cj], :]  # EE
+                # BB stays zero: scalars only, no B-mode
+                arr[ci, cj, :, 3] = raw[t_idx[ci], e_idx[cj], :]  # TE (T from ci, E from cj)
+
+        if total:
+            # C_l^{X_i,Y_j} = C_l^{XY} + C_l^{X,dY_j} + C_l^{dX_i,Y} + C_l^{dX_i,dY_j}, with
+            # channel 0's own "difference from itself" being trivially zero -- so the naive
+            # 4-term broadcast over-counts whenever i=0 or j=0 and must be special-cased.
+            prim = arr[0:1, 0:1, :, :]  # (1,1,L,4)
+            row0 = arr[0:1, :, :, :]  # (1,n_ch,L,4): primary x each channel
+            col0 = arr[:, 0:1, :, :]  # (n_ch,1,L,4): each channel x primary
+            tot = np.zeros_like(arr)
+            if n_ch > 1:
+                tot[1:, 1:] = prim + row0[:, 1:] + col0[1:, :] + arr[1:, 1:]
+                tot[0, 1:] = prim[0, 0] + row0[0, 1:]
+                tot[1:, 0] = prim[0, 0] + col0[1:, 0]
+            tot[0, 0] = arr[0, 0]
+            arr = tot
+
+        if raw_cl:
+            ls = np.arange(1, lmax + 1, dtype=np.float64)
+            fac = ls * (ls + 1) / (2 * np.pi)
+            arr[:, :, 1:, :] /= fac[None, None, :, None]
+        cmb_unit = self._CMB_unit(CMB_unit)
+        if cmb_unit is not None:
+            arr = arr * cmb_unit**2
+
+        if as_dict:
+            freqs = [0] + rayleigh_freqs
+            return {(fi, fj): arr[ci, cj] for ci, fi in enumerate(freqs) for cj, fj in enumerate(freqs)}
+        return arr
+
+    # ###################################################################
+    # ################ end of feature ########################
+    # ###################################################################
+
     def get_source_cls_dict(self, params=None, lmax=None, raw_cl=False):
         r"""
         Get all source window function and CMB lensing and cross power spectra. Does not include CMB spectra.
@@ -2001,6 +2178,15 @@ CAMB_SetUnlensedScalarArray.argtypes = [
     int_arg,
 ]
 
+# CAMB_SetRayleighScalarArray added for Rayleigh scattering, Stage 5
+CAMB_SetRayleighScalarArray = camblib.__handles_MOD_camb_setrayleighscalararray
+CAMB_SetRayleighScalarArray.argtypes = [
+    POINTER(CAMBdata),
+    int_arg,
+    ndpointer(c_double, flags="F_CONTIGUOUS", ndim=3),
+    int_arg,
+]
+
 del _set_cl_args
 
 CAMB_TimeEvolution = camblib.__handles_MOD_camb_timeevolution
@@ -2028,6 +2214,20 @@ CAMB_RayleighThermalEvolution.argtypes = [POINTER(CAMBdata), int_arg, numpy_1d, 
 CAMB_RayleighMultipoleEvolution = camblib.__handles_MOD_camb_rayleighmultipoleevolution
 CAMB_RayleighMultipoleEvolution.restype = c_int
 CAMB_RayleighMultipoleEvolution.argtypes = [
+    POINTER(CAMBdata),
+    int_arg,
+    numpy_1d,
+    int_arg,
+    numpy_1d,
+    int_arg,
+    int_arg,
+    ndpointer(c_double, flags="C_CONTIGUOUS", ndim=3),
+]
+
+# added for Rayleigh scattering, Stage 4 validation-only accessor (see camb_python.f90)
+CAMB_RayleighSourceEvolution = camblib.__handles_MOD_camb_rayleighsourceevolution
+CAMB_RayleighSourceEvolution.restype = c_int
+CAMB_RayleighSourceEvolution.argtypes = [
     POINTER(CAMBdata),
     int_arg,
     numpy_1d,

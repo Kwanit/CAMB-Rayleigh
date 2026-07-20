@@ -166,6 +166,42 @@
         real(dl), pointer :: OutputSources(:) => null()
         real(dl), pointer :: CustomSources(:) => null()
         integer :: OutputStep = 0
+        !##################################################################
+        !######### feature added for Rayleigh scattering #############
+        !########## Stage 4: validation-only per-frequency T/E source
+        !########## output, deliberately kept SEPARATE from OutputSources
+        !########## rather than extending it in place. Null/unassociated
+        !########## in every normal Cl-computing run (SetOutputSources et
+        !########## al never touch it), so this cannot perturb existing Cl
+        !########## output or the size any consumer expects OutputSources
+        !########## to be -- only the dedicated Stage 4 validation
+        !########## accessor (GetRayleighSourceEvolutionFork,
+        !########## camb_python.f90) associates it. Layout: for channel
+        !########## f_i=1..Rayleigh_NumFreq(CP%SourceTerms), 6 slots each:
+        !########## 6*(f_i-1)+1 = T_source - primary_T_source (differenced)
+        !########## 6*(f_i-1)+2 = E_source - primary_E_source (differenced)
+        !########## 6*(f_i-1)+3..6 = ISW/monopole/doppler/quadrupole phi-free
+        !########## source groups, RAW (absolute, not differenced) -- for
+        !########## the Stage 4 source-decomposition plot only.
+        !##################################################################
+        real(dl), pointer :: OutputSourcesFreq(:) => null()
+        !##################################################################
+        !######### feature added for Rayleigh scattering #############
+        !########## Stage 5: real-pipeline per-frequency T,E difference
+        !########## source output, associated by output() (below) with a
+        !########## tail slice of the actual Sources(:) array that feeds
+        !########## the standard line-of-sight/Cl pipeline -- unlike
+        !########## OutputSourcesFreq above, this DOES feed real Cl
+        !########## computation. Null/unassociated whenever num_cmb_freq=0
+        !########## (Rayleigh_NumFreq(CP%SourceTerms)), so the ordinary
+        !########## Cl pipeline is completely unaffected when Rayleigh is
+        !########## off. Layout: for channel f_i=1..num_cmb_freq, 2 slots:
+        !########## 2*(f_i-1)+1 = T_source - primary_T_source (differenced)
+        !########## 2*(f_i-1)+2 = E_source - primary_E_source (differenced)
+        real(dl), pointer :: OutputSourcesRayleigh(:) => null()
+        !###################################################################
+        !################ end of feature ########################
+        !###################################################################
 
     end type EvolutionVars
 
@@ -1851,14 +1887,37 @@
     real(dl) tau
     real(dl), target :: sources(:)
     integer, intent(in) :: num_custom_sources
+    !##########################################################################
+    !######### feature added for Rayleigh scattering #############
+    !### Stage 5: non_custom_num forward-computes the same boundary as
+    !### State%CLdata%CTransScal%NonCustomSourceNum (T,E,phi,windows,extra-
+    !### windows), i.e. one-past the start of custom sources. This mirrors
+    !### cmbmain.f90's own custom_source_off idiom (DoFlatIntegration) rather
+    !### than relying on ClTransferData exposing NonCustomSourceNum directly
+    !### (it doesn't). Rayleigh's 2*num_cmb_freq T,E-difference columns are
+    !### appended at the very TAIL of Sources(:), AFTER custom sources -- so
+    !### custom sources keep occupying exactly the same columns as before
+    !### Rayleigh existed, and every pre-existing consumer that computes a
+    !### customsources/2D-array slice from the OLD SourceNum (e.g. Python's
+    !### get_unlensed_scalar_array_cls) continues to see the unchanged
+    !### [T,E,phi,windows,customsources] prefix regardless of Rayleigh.
+    !### One source of truth: Rayleigh_NumFreq(CP%SourceTerms).
+    !##########################################################################
+    integer :: non_custom_num, num_cmb_freq
 
     yprime = 0
     EV%OutputSources => Sources
     EV%OutputStep = j
+    non_custom_num = State%num_redshiftwindows + State%num_extra_redshiftwindows + 3
     if (num_custom_sources>0) &
-        EV%CustomSources => sources(State%CLdata%CTransScal%NumSources - num_custom_sources+1:)
+        EV%CustomSources => sources(non_custom_num+1 : non_custom_num+num_custom_sources)
+    num_cmb_freq = Rayleigh_NumFreq(CP%SourceTerms)
+    if (num_cmb_freq>0) &
+        EV%OutputSourcesRayleigh => sources(non_custom_num+num_custom_sources+1 : &
+            non_custom_num+num_custom_sources+2*num_cmb_freq)
+    !######### end of feature #########
     call derivs(EV,EV%ScalEqsToPropagate,tau,y,yprime)
-    nullify(EV%OutputSources, EV%CustomSources)
+    nullify(EV%OutputSources, EV%CustomSources, EV%OutputSourcesRayleigh)
 
     end subroutine output
 
@@ -2017,6 +2076,13 @@
     nullify(EV%OutputTransfer) !Should not be needed, but avoids issues in ifort 14
     nullify(EV%OutputSources)
     nullify(EV%CustomSources)
+    nullify(EV%OutputSourcesRayleigh) ! added for Rayleigh scattering, Stage 5: same defensive
+    nullify(EV%OutputSourcesFreq) ! added for Rayleigh scattering, Stage 4: same defensive
+    ! nullify as the other Output* pointers above -- confirmed load-bearing, not just
+    ! defensive, by a real crash: EV is created via OpenMP PRIVATE(EV) in the main scalar
+    ! Cl loop (cmbmain.f90), and a fresh per-thread EV's pointer components are not
+    ! reliably left null without this, so associated(EV%OutputSourcesFreq) could
+    ! spuriously read .true. on garbage in a normal (non-Stage-4) run
 
     EV%is_cosmological_constant = State%CP%DarkEnergy%is_cosmological_constant
 
@@ -2433,6 +2499,25 @@
     integer num_cmb_freq ! added for Rayleigh scattering, count of active frequency channels
     integer f_i ! added for Rayleigh scattering, per-frequency-channel loop index
     real(dl) opac_rayleigh, opac_tot, E2_freq, polter_freq ! added for Rayleigh scattering
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !########## Stage 4: per-channel T/E source locals. opac_ch/dopac_ch/
+    !########## etc are allocated (size num_cmb_freq+1, index 1=primary,
+    !########## f_i+1=channel f_i) only when EV%OutputSourcesFreq is
+    !########## associated -- see the block after the primary source
+    !########## computation, equations.f90 (associated(EV%OutputSources)).
+    !##################################################################
+    real(dl), allocatable :: opac_ch(:), dopac_ch(:), ddopac_ch(:), vis_ch(:), dvis_ch(:), ddvis_ch(:), exptau_ch(:)
+    real(dl) a_ch_dummy, lenswin_ch_dummy
+    integer ind_ch, polind_ch
+    real(dl) clxg_ch, qg_ch, pig_ch, octg_ch, qgdot_ch, pigdot_ch, octgdot_ch
+    real(dl) E2_ch, E3_ch, Edot2_ch, Edot3_ch
+    real(dl) polter_ch, polterdot_ch, polterddot_ch
+    real(dl) ISW_ch, monopole_source_ch, doppler_ch, quadrupole_source_ch
+    real(dl) Tsource_ch, Esource_ch
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
     real(dl) dgs,sigmadot,dz
     real(dl) dgpi,dgrho_matter,grho_matter, clxnu, gpres_nu
     !non-flat vars
@@ -3141,6 +3226,140 @@
                     !We include the lensing factor of two here
                 end if
             end if
+
+            !##################################################################
+            !######### feature added for Rayleigh scattering #############
+            !########## Stage 4: per-frequency T/E source functions, phi-free
+            !########## form, stored as DIFFERENCES from the primary source
+            !########## just computed above (EV%OutputSources(1)/(2)), matching
+            !########## the old branch's own numerical-stability convention
+            !########## (camb_rayleigh_lewis/equations.f90:1553,
+            !########## `sources(s_ix+1:s_ix+2) -= sources(1:2)`).
+            !##########
+            !########## Gravity stays primary: phi, phidot, sigma, sigmadot,
+            !########## etak, dgrho, dgq, dgpi (all computed further above from
+            !########## PRIMARY densities only, unchanged by this block) feed
+            !########## every channel's ISW/monopole/doppler group exactly as
+            !########## they feed the primary's -- only the photon multipoles
+            !########## (clxg/pig/octg/qg + E-mode, reconstructed as primary+
+            !########## increment, matching Stage 3b's own convention) and the
+            !########## per-channel visibility functions (Stage 2,
+            !########## IonizationFunctionsAtTimeAllFreq) vary per channel.
+            !########## This is the exact lesson from the Benjamin port's own
+            !########## debugging: keep primary gravity primary, never let a
+            !########## per-frequency photon density leak into phi/etak/dgpi.
+            !##########
+            !########## E-mode treatment: verified against Antony
+            !########## (camb_rayleigh_lewis/equations.f90:1461-1469, ypol is a
+            !########## POINTER into y(EV%polind+1:) and the per-channel block's
+            !########## own y(EV%g_ix:EV%g_ix+EV%freq_neq-1) reconstruction slice
+            !########## spans far enough to cover EV%polind+2/+3 too, so ypol(2)/
+            !########## ypol(3) read AFTER that reconstruction are already the
+            !########## channel's own full E2/E3, not primary's) -- E2_ch/E3_ch
+            !########## below are reconstructed the same way, primary+increment.
+            !##########
+            !########## Gated on EV%Rayleigh .and. .not. EV%no_phot_multpoles,
+            !########## matching Stage 3b's dynamics gate exactly; zero-filled
+            !########## otherwise so no per-frequency source slot is ever left
+            !########## uninitialized. Entirely inert unless a caller explicitly
+            !########## associates EV%OutputSourcesFreq (only this stage's own
+            !########## validation accessor does) -- normal Cl-computing runs
+            !########## never allocate opac_ch etc or touch this block at all.
+            !##################################################################
+            !##########################################################################
+            !######### feature added for Rayleigh scattering, Stage 5 #############
+            !### Widen the gate so the shared per-channel computation below also
+            !### runs for the real-pipeline OutputSourcesRayleigh consumer (Stage 4's
+            !### OutputSourcesFreq validation accessor is untouched/still supported).
+            !### One physics computation, two independent optional outputs -- no
+            !### duplicated formulas, so the two consumers cannot drift apart.
+            !##########################################################################
+            if (associated(EV%OutputSourcesFreq) .or. associated(EV%OutputSourcesRayleigh)) then
+                if (associated(EV%OutputSourcesFreq)) EV%OutputSourcesFreq = 0
+                if (associated(EV%OutputSourcesRayleigh)) EV%OutputSourcesRayleigh = 0
+                !######### end of feature #########
+                num_cmb_freq = Rayleigh_NumFreq(CP%SourceTerms)
+                if (num_cmb_freq > 0) then
+                    if (EV%Rayleigh .and. .not. EV%no_phot_multpoles) then
+                        allocate(opac_ch(num_cmb_freq+1), dopac_ch(num_cmb_freq+1), ddopac_ch(num_cmb_freq+1), &
+                            vis_ch(num_cmb_freq+1), dvis_ch(num_cmb_freq+1), ddvis_ch(num_cmb_freq+1), &
+                            exptau_ch(num_cmb_freq+1))
+                        call EV%ThermoData%IonizationFunctionsAtTimeAllFreq(tau, a_ch_dummy, opac_ch, dopac_ch, &
+                            ddopac_ch, vis_ch, dvis_ch, ddvis_ch, exptau_ch, lenswin_ch_dummy)
+
+                        do f_i=1, num_cmb_freq
+                            ind_ch = EV%g_ix_freq + (f_i-1)*EV%freq_neq
+                            polind_ch = EV%polind_freq + (f_i-1)*EV%freq_neq
+
+                            ! channel = primary + increment, matching Stage 3b/old branch's convention
+                            clxg_ch = clxg + ay(ind_ch)
+                            pig_ch  = pig  + ay(ind_ch+2)
+                            octg_ch = octg + ay(ind_ch+3)
+                            qgdot_ch  = qgdot  + ayprime(ind_ch+1)
+                            pigdot_ch = pigdot + ayprime(ind_ch+2)
+                            octgdot_ch= octgdot+ ayprime(ind_ch+3)
+                            E2_ch = E(2) + ay(polind_ch+2)
+                            E3_ch = E(3) + ay(polind_ch+3)
+                            Edot2_ch = Edot(2) + ayprime(polind_ch+2)
+                            Edot3_ch = Edot(3) + ayprime(polind_ch+3)
+
+                            polter_ch = pig_ch/10._dl + 9._dl/15*E2_ch
+                            polterdot_ch = pigdot_ch/10._dl + 3._dl/5*Edot2_ch
+                            ! mirrors primary polterddot exactly (equations.f90, associated(EV%OutputSources)
+                            ! block above): metric/shared terms (adotoa,dgq,k,Kf,sigma,dgpi,dgrho) stay
+                            ! primary; photon multipoles and opacity/dopacity become this channel's own
+                            ! (opac_ch/dopac_ch(f_i+1) is this channel's TOTAL opacity, Rayleigh+Thomson,
+                            ! matching Antony's per-channel dopac(j,f_i) usage at equations.f90:1522)
+                            polterddot_ch = -2._dl/25*adotoa*dgq/(k*EV%Kf(1)) - 4._dl/75*adotoa*k*sigma &
+                                - 4._dl/75*dgpi - 2._dl/75*dgrho/EV%Kf(1) - 3._dl/50*k*octgdot_ch*EV%Kf(2) &
+                                + (1._dl/25)*k*qgdot_ch - 1._dl/5*k*EV%Kf(2)*Edot3_ch &
+                                + (-1._dl/10*pig_ch + (7._dl/10)*polter_ch - 3._dl/5*E2_ch)*dopac_ch(f_i+1) &
+                                + (-1._dl/10*pigdot_ch + (7._dl/10)*polterdot_ch - 3._dl/5*Edot2_ch)*opac_ch(f_i+1)
+
+                            ISW_ch = 2*phidot*exptau_ch(f_i+1)
+                            monopole_source_ch = (-etak/(k*EV%Kf(1)) + 2*phi + clxg_ch/4)*vis_ch(f_i+1)
+                            doppler_ch = ((sigma + vb)*dvis_ch(f_i+1) + (sigmadot + vbdot)*vis_ch(f_i+1))/k
+                            quadrupole_source_ch = (5._dl/8)*(3*polter_ch*ddvis_ch(f_i+1) &
+                                + 6*polterdot_ch*dvis_ch(f_i+1) + (k2*polter_ch + 3*polterddot_ch)*vis_ch(f_i+1))/k2
+
+                            Tsource_ch = ISW_ch + doppler_ch + monopole_source_ch + quadrupole_source_ch
+                            if (tau < tau0) then
+                                Esource_ch = vis_ch(f_i+1)*polter_ch*(15._dl/8._dl)/(ang_dist**2*k2)
+                            else
+                                Esource_ch = 0
+                            end if
+
+                            ! difference-from-primary storage (numerical stability, camb_rayleigh_lewis:1553)
+                            if (associated(EV%OutputSourcesFreq)) then
+                                EV%OutputSourcesFreq(6*(f_i-1)+1) = Tsource_ch - EV%OutputSources(1)
+                                EV%OutputSourcesFreq(6*(f_i-1)+2) = Esource_ch - EV%OutputSources(2)
+                                ! raw (non-differenced) phi-free source groups, validation/plotting only
+                                ! (Stage 4 plot 2: source decomposition) -- these are absolute channel
+                                ! values, not primary-subtracted, since the point is to show each group's
+                                ! own magnitude, not isolate the Rayleigh signal
+                                EV%OutputSourcesFreq(6*(f_i-1)+3) = ISW_ch
+                                EV%OutputSourcesFreq(6*(f_i-1)+4) = monopole_source_ch
+                                EV%OutputSourcesFreq(6*(f_i-1)+5) = doppler_ch
+                                EV%OutputSourcesFreq(6*(f_i-1)+6) = quadrupole_source_ch
+                            end if
+                            ! feature added for Rayleigh scattering, Stage 5: same T,E difference
+                            ! values, written into the real-pipeline tail-slice consumer instead
+                            if (associated(EV%OutputSourcesRayleigh)) then
+                                EV%OutputSourcesRayleigh(2*(f_i-1)+1) = Tsource_ch - EV%OutputSources(1)
+                                EV%OutputSourcesRayleigh(2*(f_i-1)+2) = Esource_ch - EV%OutputSources(2)
+                            end if
+                        end do
+
+                        deallocate(opac_ch, dopac_ch, ddopac_ch, vis_ch, dvis_ch, ddvis_ch, exptau_ch)
+                    end if
+                    ! else: OutputSourcesFreq/OutputSourcesRayleigh already zeroed above --
+                    ! explicit catch-all, no per-frequency source slot is ever left uninitialized
+                end if
+            end if
+            !###################################################################
+            !################ end of feature ########################
+            !###################################################################
+
             if (State%num_redshiftwindows > 0) then
                 call output_window_sources(EV, EV%OutputSources, ay, ayprime, &
                     tau, a, adotoa, grho, gpres, &
