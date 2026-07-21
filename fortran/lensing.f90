@@ -46,6 +46,7 @@
     use results
     use constants, only : const_pi, const_twopi, const_fourpi
     use MathUtils, only : Gauss_Legendre
+    use SourceWindows, only: Rayleigh_NumFreq ! added for Rayleigh scattering, Stage 5b
     !$ use omp_lib, only: omp_get_thread_num, omp_get_max_threads
     implicit none
     integer, parameter :: lensing_method_curv_corr=1,lensing_method_flat_corr=2, &
@@ -125,6 +126,13 @@
     else
         error stop 'Unknown lensing method'
     end if
+
+    ! feature added for Rayleigh scattering, Stage 5b: lens the primary+Rayleigh
+    ! channel-pair covariance too, reusing the same curved-sky machinery just used
+    ! for the primary above (see LensRayleighChannels banner for the full reasoning,
+    ! including how "lens the difference vs lens-then-difference" is resolved).
+    ! Inert (returns immediately) whenever no Rayleigh frequencies are configured.
+    if (global_error_flag == 0) call LensRayleighChannels(State)
     end subroutine lens_Cls
 
     subroutine LensClsWithDefaultSpectrum(State, full_range)
@@ -891,6 +899,128 @@
     end associate
 
     end subroutine CorrFuncFullSky
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !### Stage 5b: lens the primary + per-frequency-Rayleigh-channel
+    !### covariance, reusing EXACTLY the same curved-sky routines just
+    !### used to lens the primary above (CorrFuncFullSkyApodized /
+    !### CorrFuncFullSky via PrepareLensedCLSpectra) -- not a parallel
+    !### implementation. Called once per ORDERED channel pair (i,j),
+    !### i,j = 1..n_ch (1=primary, 2..n_ch=Rayleigh bands), using the
+    !### SAME lensing-potential CPP computed once for the primary: the
+    !### deflection field is sourced by matter/metric perturbations,
+    !### not photon frequency, so the identical potential lenses every
+    !### channel and every cross-term between channels ("all legs
+    !### lensed, including the primary" falls out automatically, since
+    !### for a pair (i,j) the fed-in (CTT,CEE,CTE) triple IS the actual
+    !### unlensed two-point function between whichever fields channels
+    !### i and j represent -- the output is therefore the correctly
+    !### both-legs-lensed cross-spectrum, not a single-leg
+    !### approximation).
+    !###
+    !### DIFFERENCE-vs-TOTAL: the Rayleigh channels' stored T,E sources
+    !### are DIFFERENCES from the primary (Stage 4/5), so this routine
+    !### lenses those difference-based Cl_scalar_array entries directly
+    !### -- it does NOT reconstruct absolute per-channel totals, lens
+    !### them, and re-difference. This is exact, not an approximation:
+    !### PrepareLensedCLSpectra's core convolution (l <= CP%Max_l) is
+    !### LINEAR in the fed (CTT,CEE,CTE) for fixed CPP -- no term in the
+    !### theta-integral kernel ever multiplies two different input
+    !### spectra together, the kernel depends only on CPP and geometry.
+    !### So for any two fields A,B sharing the same deflection field,
+    !###   Lens(Cl^{A,B}) - Lens(Cl^{A,Primary}) == Lens(Cl^{A,B} - Cl^{A,Primary})
+    !### exactly, at the level of this algorithm -- lensing the stored
+    !### difference gives precisely the same answer as lensing the total
+    !### and re-differencing would, with no extra Fortran-side
+    !### reconstruction needed. This was verified analytically by reading
+    !### the accumulation loop (corr(1)=corr(1)+CTT(l)*fac, etc: each
+    !### output type is a linear functional of exactly one input
+    !### spectrum) and confirmed empirically in the Stage 5b validation
+    !### notebook. The ONE place this is not exactly linear is the
+    !### high-L (l>CP%Max_l) TE-tail extrapolation inside
+    !### PrepareLensedCLSpectra, which fills in a geometric-mean
+    !### tail_te_fac=sqrt(max(0,fac2*fac3)) assuming non-negative
+    !### TT/EE-like inputs; for a genuinely-signed cross-covariance in
+    !### that slot (as a primary x Rayleigh-difference TE input can be)
+    !### this clamps to zero rather than extrapolating a sensible value
+    !### -- a narrow, pre-existing limitation of the shared machinery,
+    !### confined to l > CP%Max_l, quantified in the validation notebook.
+    !##################################################################
+    subroutine LensRayleighChannels(State)
+    class(CAMBdata) :: State
+    integer :: num_cmb_freq, n_ch, n_full, i, j, ti, ei, tj, ej, l
+    real(dl), allocatable :: CPP(:)
+    Type(TCLData) :: CL_tmp, CLout_tmp
+    logical :: full_range
+
+    num_cmb_freq = Rayleigh_NumFreq(State%CP%SourceTerms)
+    if (num_cmb_freq == 0) return
+    if (.not. allocated(State%CLdata%Cl_scalar_array)) return
+
+    n_ch = num_cmb_freq + 1
+    n_full = size(State%CLdata%Cl_scalar_array, 2)
+
+    allocate(CPP(0:State%CP%max_l))
+    call SetLensingPotentialSpectrum(State, CPP)
+    ! Rayleigh channels always use the curved-sky method (matching whichever of the
+    ! two curved-sky variants AccurateBB selects for the primary), regardless of any
+    ! lensing_method=2/3 (flat-sky/harmonic) override for the primary -- those legacy
+    ! methods have no equivalent "custom input spectrum" hook to extend. Deferred; see
+    ! Stage 5b deliverables.
+    full_range = State%CP%Accuracy%AccurateBB
+
+    if (allocated(State%CLdata%Cl_lensed_rayleigh)) deallocate(State%CLdata%Cl_lensed_rayleigh)
+    if (allocated(CL_tmp%Cl_scalar)) deallocate(CL_tmp%Cl_scalar)
+    allocate(CL_tmp%Cl_scalar(State%CP%Min_l:State%CP%Max_l, C_Temp:C_Cross), source=0._dl)
+
+    do i = 1, n_ch
+        ! one source of truth for the physical-column mapping: mirrors
+        ! CAMB_SetRayleighScalarArray (camb_python.f90) exactly -- channel 1 = primary
+        ! (physical columns 1,2); channel c>1 = Rayleigh band c-1 (physical tail
+        ! columns n_full-2*num_cmb_freq+1 .. n_full)
+        if (2*i-1 <= 2) then
+            ti = 2*i - 1
+            ei = 2*i
+        else
+            ti = n_full - 2*num_cmb_freq + (2*i-1) - 2
+            ei = n_full - 2*num_cmb_freq + (2*i) - 2
+        end if
+        do j = 1, n_ch
+            if (2*j-1 <= 2) then
+                tj = 2*j - 1
+                ej = 2*j
+            else
+                tj = n_full - 2*num_cmb_freq + (2*j-1) - 2
+                ej = n_full - 2*num_cmb_freq + (2*j) - 2
+            end if
+
+            do l = State%CP%Min_l, State%CP%Max_l
+                CL_tmp%Cl_scalar(l, C_Temp)  = State%CLdata%Cl_scalar_array(l, ti, tj)
+                CL_tmp%Cl_scalar(l, C_E)     = State%CLdata%Cl_scalar_array(l, ei, ej)
+                CL_tmp%Cl_scalar(l, C_Cross) = State%CLdata%Cl_scalar_array(l, ti, ej)
+            end do
+
+            if (full_range) then
+                call CorrFuncFullSky(State, CL_tmp, CLout_tmp, CPP, State%CP%Min_l, LensingExtrapLmax(State))
+            else
+                call CorrFuncFullSkyApodized(State, CL_tmp, CLout_tmp, CPP, State%CP%Min_l, LensingExtrapLmax(State))
+            end if
+            if (global_error_flag /= 0) return
+
+            if (.not. allocated(State%CLdata%Cl_lensed_rayleigh)) then
+                allocate(State%CLdata%Cl_lensed_rayleigh( &
+                    State%CP%Min_l:CLout_tmp%lmax_lensed, n_ch, n_ch, 1:4), source=0._dl)
+            end if
+            do l = State%CP%Min_l, CLout_tmp%lmax_lensed
+                State%CLdata%Cl_lensed_rayleigh(l, i, j, :) = CLout_tmp%Cl_lensed(l, :)
+            end do
+        end do
+    end do
+    end subroutine LensRayleighChannels
+    !###################################################################
+    !################ end of feature ########################
+    !###################################################################
 
     subroutine CorrFuncFlatSky(State)
     !Do flat sky approx partially non-perturbative lensing, lensing_method=2

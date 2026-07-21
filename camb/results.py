@@ -1531,31 +1531,54 @@ class CAMBdata(F2003Class):
     # ### Stage 5: per-frequency Rayleigh-scattering C_ell, exposed as either
     # ### the raw full covariance array or a frequency-keyed dict.
     # ##########################################################################
-    def get_rayleigh_cls(self, lmax=None, CMB_unit=None, raw_cl=False, as_dict=False, total=False):
+    def get_rayleigh_cls(self, lmax=None, CMB_unit=None, raw_cl=False, as_dict=False, total=False, lensed=True):
         r"""
-        Get the full covariance of unlensed primary and per-frequency Rayleigh-scattering
-        C_ell, for every channel pair, both orderings. Must have already calculated power
-        spectra with :attr:`.model.CAMBparams.SourceTerms.rayleigh_scattering` set.
+        Get the full covariance of primary and per-frequency Rayleigh-scattering C_ell,
+        for every channel pair, both orderings. Must have already calculated power spectra
+        with :attr:`.model.CAMBparams.SourceTerms.rayleigh_scattering` set.
 
-        Everything here is **unlensed** (including the primary): the Rayleigh channels are
-        computed unlensed, so mixing a lensed primary with unlensed Rayleigh channels would
-        be physically inconsistent. Lensing of these spectra is not implemented yet.
+        By default (``lensed=True``, added in Stage 5b) the returned covariance is
+        **lensed** (including the primary), matching :attr:`.model.CAMBparams.DoLensing`'s
+        own default of ``True`` -- i.e. calling this with no arguments now gives the same
+        lensed/unlensed choice as the rest of CAMB. Pass ``lensed=False`` explicitly for
+        the unlensed covariance instead (this is what Stages 1-5 validated against the
+        reference implementation, and remains available unchanged) -- see below for
+        exactly what "lensed" means here and its one known limitation.
 
         Channel 0 is the primary; channels 1..N follow the order of
         :attr:`.model.SourceTermParams.rayleigh_frequencies`. By default (``total=False``)
         the values are DIFFERENCE spectra from the primary -- i.e. for i>0,
         arr[0,i] is :math:`C_\ell^{T,\,dT_i}` (primary T against channel i's T MINUS
         primary T source), and for i,j>0, arr[i,j] is :math:`C_\ell^{dT_i,\,dT_j}` --
-        except arr[0,0], which is the ordinary primary unlensed auto-spectrum (never a
+        except arr[0,0], which is the ordinary primary auto-spectrum (never a
         difference). This is the quantity validated directly against the reference
         implementation.
 
         The returned array (or dict) is the FULL n_ch x n_ch matrix: arr[i,j] and arr[j,i]
         are both populated and are **not** equal in general -- for the mixed TE spectrum,
         :math:`C_\ell^{T_i,E_j} \neq C_\ell^{T_j,E_i}` because temperature is taken from one
-        channel and polarization from the other. TT, EE (and BB, always zero here since this
-        is scalars-only) are symmetric under i<->j; only TE differs by ordering. Storing only
-        a triangle would silently discard that TE/ET distinction.
+        channel and polarization from the other. TT, EE (and BB) are symmetric under
+        i<->j; only TE differs by ordering. Storing only a triangle would silently discard
+        that TE/ET distinction.
+
+        **What "lensed" means here.** Every channel -- the primary and every Rayleigh band
+        -- is deflected by the SAME lensing potential (sourced by matter/metric
+        perturbations, not photon frequency), so ``lensed=True`` lenses BOTH legs of every
+        cross-spectrum: e.g. for ``arr[0,i]`` (:math:`C_\ell^{T,\,dT_i}`), the primary leg
+        is lensed too, not just the Rayleigh leg -- mixing a lensed leg with an unlensed
+        one would be physically inconsistent, and this accessor never does that. The
+        DIFFERENCE-vs-total semantics are unaffected by lensing: lensing is linear in the
+        (unlensed) spectrum fed to it for a fixed lensing potential, so lensing the stored
+        difference spectra directly gives exactly the same result as reconstructing
+        absolute totals, lensing those, and re-differencing would -- no separate
+        "lens totals" code path is needed, and ``total=True`` (below) reconstructs lensed
+        totals from lensed differences exactly as it does for the unlensed case. The one
+        known limitation (shared with plain CAMB's own lensed TE at very high :math:`\ell`)
+        is a high-:math:`\ell` (:math:`\ell` above the unlensed calculation's :math:`\ell_{\max}`)
+        TE extrapolation that assumes non-negative TT/EE-like inputs; for the signed
+        primary-Rayleigh TE cross-term this can under-extrapolate right at the top of the
+        :math:`\ell` range -- negligible in practice, quantified in the Stage 5b validation
+        notebook.
 
         :param lmax: maximum :math:`\ell`
         :param CMB_unit: scale results from dimensionless. Use 'muK' for :math:`\mu K^2` units.
@@ -1567,10 +1590,18 @@ class CAMBdata(F2003Class):
           C_\ell^{dT_i,dT_j}`, and the analogous combination respecting ordering for the
           mixed TE case), reconstructed in Python from the stored difference spectra --
           no extra Fortran computation. The primary used in the reconstruction is the
-          unlensed primary. Default is False (the validated, difference-based quantity).
+          primary spectrum in the same lensed/unlensed state as the rest of the call.
+          Default is False (the validated, difference-based quantity).
+        :param lensed: default True: return the lensed covariance (both legs of every
+          cross-spectrum lensed by the same potential). Requires ``DoLensing=True`` to
+          have been set before computing power spectra; raises
+          :class:`~.baseconfig.CAMBError` otherwise (never silently falls back to
+          unlensed). Pass ``False`` for the unlensed covariance.
         :return: if ``as_dict`` is False (default), a numpy array of shape
           ``(n_ch, n_ch, lmax+1, 4)`` indexed ``[channel_i, channel_j, ell, spectrum]``
-          with n_ch = num_cmb_freq+1 and the last axis TT, EE, BB, TE (BB is always zero).
+          with n_ch = num_cmb_freq+1 and the last axis TT, EE, BB, TE (BB is zero unless
+          ``lensed=True``, since lensing generates B-modes from E even for scalars --
+          with the new default, BB is populated unless you pass ``lensed=False``).
           If ``as_dict`` is True, a dict mapping ``(freq_i, freq_j)`` (int GHz, 0=primary)
           to a ``(lmax+1, 4)`` array in the same TT,EE,BB,TE column order; both orderings
           are included as separate keys (e.g. ``d[(217, 857)]`` and ``d[(857, 217)]`` are
@@ -1581,26 +1612,41 @@ class CAMBdata(F2003Class):
         num_cmb_freq = len(rayleigh_freqs)
         if num_cmb_freq == 0:
             raise CAMBError("get_rayleigh_cls: no SourceTerms.rayleigh_frequencies configured")
-
-        lmax = self._lmax_setting(lmax, unlensed=True)
-        n_raw = 2 + 2 * num_cmb_freq
-        raw = np.empty((n_raw, n_raw, lmax + 1), order="F")
-        CAMB_SetRayleighScalarArray(byref(self), byref(c_int(lmax)), raw, byref(c_int(num_cmb_freq)))
-
-        # raw index convention (0-based): 0=primary T, 1=primary E, then per
-        # channel c=1..num_cmb_freq: 2+2*(c-1)=T, 2+2*(c-1)+1=E (see camb_python.f90
-        # CAMB_SetRayleighScalarArray banner for the Fortran-side layout this mirrors)
         n_ch = num_cmb_freq + 1
-        t_idx = [0] + [2 + 2 * (c - 1) for c in range(1, n_ch)]
-        e_idx = [1] + [2 + 2 * (c - 1) + 1 for c in range(1, n_ch)]
 
-        arr = np.zeros((n_ch, n_ch, lmax + 1, 4))
-        for ci in range(n_ch):
-            for cj in range(n_ch):
-                arr[ci, cj, :, 0] = raw[t_idx[ci], t_idx[cj], :]  # TT
-                arr[ci, cj, :, 1] = raw[e_idx[ci], e_idx[cj], :]  # EE
-                # BB stays zero: scalars only, no B-mode
-                arr[ci, cj, :, 3] = raw[t_idx[ci], e_idx[cj], :]  # TE (T from ci, E from cj)
+        if lensed:
+            # lensed=True added for Rayleigh scattering, Stage 5b: requires DoLensing to
+            # have been set at compute time -- checked explicitly here (rather than just
+            # letting an unallocated Fortran array silently zero-fill) so misuse errors
+            # clearly instead of returning silently-wrong all-zero spectra.
+            if not self.Params.DoLensing:
+                raise CAMBError(
+                    "get_rayleigh_cls: lensed=True (the default) requires DoLensing=True to have been "
+                    "set before computing power spectra. Either set pars.DoLensing = True and recompute, "
+                    "or call get_rayleigh_cls(lensed=False) for the unlensed covariance."
+                )
+            lmax = self._lmax_setting(lmax, unlensed=False)
+            arr = np.empty((n_ch, n_ch, lmax + 1, 4), order="F")
+            CAMB_SetRayleighLensedScalarArray(byref(self), byref(c_int(lmax)), arr, byref(c_int(n_ch)))
+        else:
+            lmax = self._lmax_setting(lmax, unlensed=True)
+            n_raw = 2 + 2 * num_cmb_freq
+            raw = np.empty((n_raw, n_raw, lmax + 1), order="F")
+            CAMB_SetRayleighScalarArray(byref(self), byref(c_int(lmax)), raw, byref(c_int(num_cmb_freq)))
+
+            # raw index convention (0-based): 0=primary T, 1=primary E, then per
+            # channel c=1..num_cmb_freq: 2+2*(c-1)=T, 2+2*(c-1)+1=E (see camb_python.f90
+            # CAMB_SetRayleighScalarArray banner for the Fortran-side layout this mirrors)
+            t_idx = [0] + [2 + 2 * (c - 1) for c in range(1, n_ch)]
+            e_idx = [1] + [2 + 2 * (c - 1) + 1 for c in range(1, n_ch)]
+
+            arr = np.zeros((n_ch, n_ch, lmax + 1, 4))
+            for ci in range(n_ch):
+                for cj in range(n_ch):
+                    arr[ci, cj, :, 0] = raw[t_idx[ci], t_idx[cj], :]  # TT
+                    arr[ci, cj, :, 1] = raw[e_idx[ci], e_idx[cj], :]  # EE
+                    # BB stays zero: unlensed scalars have no B-mode
+                    arr[ci, cj, :, 3] = raw[t_idx[ci], e_idx[cj], :]  # TE (T from ci, E from cj)
 
         if total:
             # C_l^{X_i,Y_j} = C_l^{XY} + C_l^{X,dY_j} + C_l^{dX_i,Y} + C_l^{dX_i,dY_j}, with
@@ -2186,6 +2232,15 @@ CAMB_SetRayleighScalarArray.argtypes = [
     POINTER(CAMBdata),
     int_arg,
     ndpointer(c_double, flags="F_CONTIGUOUS", ndim=3),
+    int_arg,
+]
+
+# CAMB_SetRayleighLensedScalarArray added for Rayleigh scattering, Stage 5b
+CAMB_SetRayleighLensedScalarArray = camblib.__handles_MOD_camb_setrayleighlensedscalararray
+CAMB_SetRayleighLensedScalarArray.argtypes = [
+    POINTER(CAMBdata),
+    int_arg,
+    ndpointer(c_double, flags="F_CONTIGUOUS", ndim=4),
     int_arg,
 ]
 

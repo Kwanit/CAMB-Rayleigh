@@ -174,6 +174,23 @@
         integer lmax_lensed !Only accurate to rather less than this
         real(dl) , dimension (:,:), allocatable :: Cl_lensed
         !Cl_lensed(l, Cl_type) are the interpolated Cls
+
+        !##################################################################
+        !######### feature added for Rayleigh scattering #############
+        !### Stage 5b: lensed primary+Rayleigh channel-pair covariance.
+        !### Indices (l, i, j, Cl_type) with i,j = 1..n_ch (1=primary,
+        !### 2..n_ch=Rayleigh bands in SourceTerms%rayleigh_frequencies
+        !### order -- this is the same channel numbering
+        !### CAMB_SetRayleighScalarArray/CAMB_SetRayleighLensedScalarArray
+        !### expose to Python, NOT the raw physical-column numbering
+        !### Cl_scalar_array uses) and Cl_type = CT_Temp:CT_Cross (TT,EE,
+        !### BB,TE). Allocated lazily inside lensing.f90's
+        !### LensRayleighChannels (like Cl_lensed above, NOT here in
+        !### InitCls -- lensed arrays only exist once lensing actually runs).
+        real(dl), dimension(:,:,:,:), allocatable :: Cl_lensed_rayleigh
+        !###################################################################
+        !################ end of feature ########################
+        !###################################################################
     contains
     procedure :: InitCls => TCLdata_InitCls
     procedure :: output_cl_files => TCLdata_output_cl_files

@@ -709,6 +709,32 @@
     end if
 
     end subroutine CAMB_SetRayleighScalarArray
+
+    !##################################################################
+    !######### feature added for Rayleigh scattering #############
+    !### Stage 5b: export the lensed primary+Rayleigh channel-pair
+    !### covariance. Much simpler than CAMB_SetRayleighScalarArray above:
+    !### Cl_lensed_rayleigh (lensing.f90 LensRayleighChannels) is already
+    !### stored directly in channel-index space (1=primary, 2..n_ch=
+    !### Rayleigh bands) with axis order (l,i,j,type) matching exactly
+    !### what the Python side wants, so no raw-physical-column remapping
+    !### is needed here at all -- just a bounds-checked copy.
+    !##################################################################
+    subroutine CAMB_SetRayleighLensedScalarArray(Data, lmax, RayleighArray, n_ch)
+    Type(CAMBdata) :: Data
+    integer, intent(IN) :: lmax, n_ch
+    real(dl), intent(OUT) :: RayleighArray(n_ch, n_ch, 0:lmax, 4)
+    integer l, lmx
+
+    RayleighArray = 0
+    if (allocated(Data%CLData%Cl_lensed_rayleigh)) then
+        lmx = min(lmax, ubound(Data%CLData%Cl_lensed_rayleigh, 1))
+        do l = Data%CP%Min_l, lmx
+            RayleighArray(1:n_ch, 1:n_ch, l, :) = Data%CLData%Cl_lensed_rayleigh(l, 1:n_ch, 1:n_ch, :)
+        end do
+    end if
+
+    end subroutine CAMB_SetRayleighLensedScalarArray
     !###################################################################
     !################ end of feature ########################
     !###################################################################
