@@ -8,6 +8,19 @@ recfast_hyrec = "hyrec"
 
 recfast_default = recfast_cosmorec
 
+# ##################################################################
+# ######### feature added for clumping / PMF recombination #########
+# ########## Three-zone phenomenological model of PMF-modified
+# ########## recombination (see "Fresh Branch Tests/6 - Clumpy
+# ########## Recombination.ipynb"). Enable with Recfast.clumping and
+# ########## set the clumping factor Recfast.clumping_b >= 0.
+# ##################################################################
+clumping_model_M1 = 1  # low-density zone overdensity Delta_1 = 0.1
+clumping_model_M2 = 2  # low-density zone overdensity Delta_1 = 0.3
+# ##################################################################
+# ################ end of feature #################################
+# ##################################################################
+
 recfast_approx_model_params = {
     recfast_planck: {
         "RECFAST_fudge": 1.125,
@@ -91,12 +104,18 @@ class Recfast(RecombinationModel):
         ("use_rosenbrock", c_bool),
         ("rosenbrock_handoff_xH", c_double),
         ("rosenbrock_tol", c_double),
+        # ##### feature added for clumping / PMF recombination #####
+        # ##### must match the field order of type TRecfast in fortran/recfast.f90 #####
+        ("clumping", c_bool, "enable the three-zone PMF-clumping recombination model"),
+        ("clumping_model", c_int, "clumping zone model: 1 = M1 (Delta_1=0.1), 2 = M2 (Delta_1=0.3)"),
+        ("clumping_b", c_double, "clumping factor b = <Delta^2> - 1 (>= 0; 0 reproduces standard recombination)"),
+        # ##### end of feature #####
     )
 
     _fortran_class_module_ = "Recombination"
     _fortran_class_name_ = "TRecfast"
 
-    def set_params(self, recfast_approx_model=None):
+    def set_params(self, recfast_approx_model=None, clumping=None, clumping_b=None, clumping_model=None):
         """
         Set RECFAST approximation parameters.
 
@@ -106,6 +125,9 @@ class Recfast(RecombinationModel):
             - ``cosmorec``: RECFAST fit with an He rate correction to direct CosmoRec ``accuracy=6`` with
               10 H shells.
             - ``hyrec``: seven-parameter RECFAST fit to direct HyRec-2.
+        :param clumping: (feature added for clumping) enable the three-zone PMF-clumping recombination model
+        :param clumping_b: (feature added for clumping) clumping factor b = <Delta^2> - 1, must be >= 0
+        :param clumping_model: (feature added for clumping) 1 = M1 (Delta_1=0.1) or 2 = M2 (Delta_1=0.3)
 
         :return: self
         """
@@ -119,6 +141,17 @@ class Recfast(RecombinationModel):
                 ) from err
             for name, value in params.items():
                 setattr(self, name, value)
+
+        # ##### feature added for clumping / PMF recombination #####
+        if clumping_model is not None:
+            self.clumping_model = int(clumping_model)
+        if clumping_b is not None:
+            if clumping_b < 0:
+                raise CAMBValueError("clumping factor b must be non-negative")
+            self.clumping_b = float(clumping_b)
+        if clumping is not None:
+            self.clumping = bool(clumping)
+        # ##### end of feature #####
 
         return self
 
@@ -141,6 +174,11 @@ class Recfast(RecombinationModel):
                 "use_rosenbrock",
                 "rosenbrock_handoff_xH",
                 "rosenbrock_tol",
+                # ##### feature added for clumping / PMF recombination: ini write side, mirrors TRecfast_ReadParams #####
+                "clumping",
+                "clumping_model",
+                "clumping_b",
+                # ##### end of feature #####
             ),
             rename={
                 "Nz": "RECFAST_nz",

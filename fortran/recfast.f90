@@ -210,7 +210,7 @@
     use Interpolation, only : cubic_spline_regular_horner_coefficients, cubic_spline_regular_second_derivs
     use MathUtils
     use RungeKuttaDP45Module, only : RungeKuttaDP45Settings, TClassRungeKuttaDP45
-    use Config, only : GlobalError, error_recombination
+    use Config, only : GlobalError, error_recombination, global_error_flag ! global_error_flag added for clumping, error propagation from TRecfast_ClumpingZones
     use results
     use MpiUtils, only : MpiStop
     implicit none
@@ -252,6 +252,36 @@
     ! Tuned for the fast handoff path; full-range Rosenbrock should use a tighter tol.
     real(dl), parameter :: RECFAST_rosenbrock_tol_default = 3.e-4_dl
     integer, parameter :: RECFAST_rosenbrock_max_steps = 4096
+
+    !##################################################################
+    !######### feature added for clumping / PMF recombination ##########
+    !########## Three-zone phenomenological model of a clumpy baryon
+    !########## distribution (PMF-modified recombination proxy). The
+    !########## universe is split into 3 density zones with overdensity
+    !########## Delta_i and volume fraction f_V^i constrained by
+    !##########   sum f_V^i = 1,  sum f_V^i Delta_i = 1,
+    !##########   sum f_V^i Delta_i^2 = 1 + b
+    !########## where b (clumping_b) is the tunable clumping factor
+    !########## b = <Delta^2> - 1 >= 0. A model fixes (Delta_1, Delta_2,
+    !########## f_V^2); (Delta_3, f_V^1, f_V^3) then follow in closed form
+    !########## for ARBITRARY (Delta_1, Delta_2, f_V^2) -- see the general
+    !########## P/Q/R derivation in TRecfast_ClumpingZones. Models M1/M2
+    !########## are the special case Delta_2 = 1, f_V^2 = 1/3 (only
+    !########## Delta_1 differs). See also
+    !########## "Fresh Branch Tests/6 - Clumpy Recombination.ipynb".
+    !##################################################################
+    integer, parameter :: clumping_model_M1 = 1
+    integer, parameter :: clumping_model_M2 = 2
+    real(dl), parameter :: clumping_M1_Delta1 = 0.1_dl   ! M1 low-density zone overdensity
+    real(dl), parameter :: clumping_M2_Delta1 = 0.3_dl   ! M2 low-density zone overdensity
+    real(dl), parameter :: clumping_Delta2 = 1._dl       ! M1/M2 middle zone overdensity (mean density)
+    real(dl), parameter :: clumping_fvol2 = 1._dl/3._dl  ! M1/M2 middle zone volume fraction
+    integer, parameter :: clumping_max_zones = 3
+    ! |Q - P*Delta_1| or |Delta_3 - Delta_1| below this => degenerate three-zone parameters
+    real(dl), parameter :: clumping_degenerate_tol = 1.e-12_dl
+    !###################################################################
+    !################ end of feature ###################################
+    !###################################################################
 
     Type RecombinationData
         real(dl) :: Recombination_saha_z !Redshift at which saha OK
@@ -304,6 +334,18 @@
         logical  :: use_rosenbrock = RECFAST_use_rosenbrock_default
         real(dl) :: rosenbrock_handoff_xH = RECFAST_rosenbrock_handoff_xH_default
         real(dl) :: rosenbrock_tol = RECFAST_rosenbrock_tol_default
+        !##################################################################
+        !######### feature added for clumping / PMF recombination ##########
+        !########## Python-settable (mirrored in camb/recombination.py
+        !########## Recfast._fields_ in this exact order). Off by default:
+        !########## clumping=.false. reproduces standard RECFAST exactly.
+        !##################################################################
+        logical  :: clumping = .false.          ! master switch for the three-zone PMF-clumping recombination model
+        integer  :: clumping_model = clumping_model_M1  ! 1 = M1 (Delta_1 = 0.1), 2 = M2 (Delta_1 = 0.3)
+        real(dl) :: clumping_b = 0._dl           ! clumping factor b = <Delta^2> - 1  (must be >= 0; b = 0 => homogeneous)
+        !##################################################################
+        !################ end of feature ##################################
+        !##################################################################
         Type(RecombinationData), allocatable :: Calc
     contains
     procedure :: ReadParams => TRecfast_ReadParams
@@ -417,6 +459,11 @@
     this%use_rosenbrock = Ini%Read_Logical("RECFAST_use_rosenbrock", this%use_rosenbrock)
     this%rosenbrock_handoff_xH = Ini%Read_Double("RECFAST_rosenbrock_handoff_xH", this%rosenbrock_handoff_xH)
     this%rosenbrock_tol = Ini%Read_Double("RECFAST_rosenbrock_tol", this%rosenbrock_tol)
+    !##### feature added for clumping / PMF recombination: ini read side, mirrored by Recfast.write_ini #####
+    this%clumping = Ini%Read_Logical('clumping', this%clumping)
+    this%clumping_model = Ini%Read_Int('clumping_model', this%clumping_model)
+    this%clumping_b = Ini%Read_Double('clumping_b', this%clumping_b)
+    !##### end of feature #####
     end subroutine TRecfast_ReadParams
 
     subroutine TRecfast_Validate(this, OK)
@@ -435,6 +482,18 @@
         OK = .false.
         write(*,*) "RECFAST_rosenbrock_tol must be > 0"
     end if
+    !##### feature added for clumping / PMF recombination #####
+    if (this%clumping) then
+        if (this%clumping_b < 0._dl) then
+            OK = .false.
+            write(*,*) "clumping factor b must be non-negative"
+        end if
+        if (this%clumping_model /= clumping_model_M1 .and. this%clumping_model /= clumping_model_M2) then
+            OK = .false.
+            write(*,*) "clumping_model must be 1 (M1) or 2 (M2)"
+        end if
+    end if
+    !##### end of feature #####
     end subroutine TRecfast_Validate
 
 
@@ -520,6 +579,14 @@
     !########## effective neutral-scatterer fraction accessor, mirrors
     !########## TRecfast_xe above exactly but reads x_rayleigh_eff_horner
     !########## (physics/logic oracle: camb_rayleigh_lewis/recfast.f90:460-482)
+    !##########
+    !########## Stage 2 added for clumping: no change here -- when clumping
+    !########## is on, TRecfast_init stores the density-weighted zone
+    !########## average <x_Rayleigh_eff>(z) into the same x_rayleigh_eff
+    !########## spline this reads, so the accessor (and all downstream
+    !########## Rayleigh opacity code) transparently sees the clumped
+    !########## value; clumping off => the array holds the unchanged
+    !########## homogeneous single-zone value.
     !##################################################################
     function TRecfast_Recombination_rayleigh_eff(this,a)
     class(TRecfast) :: this
@@ -633,7 +700,7 @@
     integer :: I
     Type(RecombinationData), pointer :: Calc
     logical, intent(in), optional :: WantTSpin
-    real(dl) :: z,n,x,x0,rhs,x_H,x_He,x_H0,x_He0,H, Yp
+    real(dl) :: z,x,x0,rhs,x_H,x_He,x_H0,x_He0,H, Yp   ! n removed for clumping: its only use (a dead local) was dropped in the three-zone refactor
     real(dl) :: zstart,zend,z_scale, rosenbrock_tol, rk45_tol_use, background_step_boost
     type(RungeKuttaDP45Settings) :: rk_settings
     real(dl), dimension(:,:), allocatable :: w
@@ -643,6 +710,11 @@
     real(dl), parameter :: rk45_tol=3D-6            !Input tolerance for RungeKuttaDP45
     procedure(TClassRungeKuttaDP45) :: RungeKuttaDP45
     logical :: storage_ok, rosenbrock_handed_off, rosenbrock_ok
+    !##### feature added for clumping / PMF recombination: three-zone orchestration state #####
+    integer :: n_clump_zones, izone
+    real(dl) :: Nnow_homogeneous
+    real(dl) :: clump_delta(clumping_max_zones), clump_fvol(clumping_max_zones)
+    !##### end of feature #####
 
 
     if (.not. allocated(this%Calc)) allocate(this%Calc)
@@ -659,14 +731,8 @@
 
         Calc%n_eq = 3
         if (Evolve_Ts) Calc%n_eq=4
-        allocate(w(Calc%n_eq,9))
-
-        Calc%Recombination_saha_z=0.d0
 
         Calc%Tnow = State%CP%tcmb
-
-        z = zinitial
-        ainv = 1._dl + z
 
         H = State%CP%H0/100._dl
 
@@ -687,8 +753,60 @@
 
         Calc%Nnow = 3._dl*bigH**2*State%CP%ombh2/(const_eightpi*G*Calc%mu_H*m_H)
 
-        n = Calc%Nnow*ainv**3
         Calc%z_eq = State%z_eq
+
+        !##################################################################
+        !######### feature added for clumping / PMF recombination ##########
+        !########## Three-zone model. The recombination integration
+        !########## below is run once per density zone, scaling ONLY the
+        !########## hydrogen number density that feeds the recombination
+        !########## RATE -- implemented by rescaling Calc%Nnow, which
+        !########## EvaluateRecfastODE reads solely in the two-body capture
+        !########## term, the Peebles/Sobolev density factors and the Saha
+        !########## initial conditions. H(z) (dtauda(Calc%State)), T_gamma
+        !########## (Calc%Tnow) and the T_m / Compton coupling are
+        !########## density-independent and stay at their global Delta = 1
+        !########## values. Every stored global history is the SAME
+        !########## mass(density)-weighted zone average, with weights
+        !########## sum_i f_V^i Delta_i = 1 (the mass-conservation constraint):
+        !##########   <X_e>(z)            = sum_i f_V^i Delta_i x_e^i(z)
+        !##########   <x_Rayleigh_eff>(z) = sum_i f_V^i Delta_i
+        !##########                         [ (1-x_H^i) + f_He,R (1-x_He^i) f_He ]   (Stage 2)
+        !##########   <T_m>(z)            = sum_i f_V^i Delta_i T_m^i(z)             (Stage 3)
+        !##########   <T_s>(z)            = sum_i f_V^i Delta_i T_s^i(z)             (Stage 3, 21cm only)
+        !########## The <T_m> mass-weighting is a documented modeling
+        !########## convention (mass-averaged gas temperature, consistent
+        !########## with <X_e>); each zone's T_m^i is the ODE's own y(3)
+        !########## from that zone's Route-B solve. Only Recombination_saha_z
+        !########## still comes from the LAST pass, which TRecfast_ClumpingZones
+        !########## makes the fixed middle (Delta_2) zone -- the homogeneous
+        !########## Delta = 1 zone for models M1/M2.
+        !########## clumping = .false. (or clumping_b = 0) => n_clump_zones = 1,
+        !########## and this is exactly the original single homogeneous solve.
+        !##################################################################
+        Nnow_homogeneous = Calc%Nnow
+        call TRecfast_ClumpingZones(this, n_clump_zones, clump_delta, clump_fvol)
+        if (global_error_flag /= 0) return
+        if (n_clump_zones > 1) then
+            Calc%xrec = 0._dl            ! accumulator for the density-weighted average <X_e>
+            Calc%x_rayleigh_eff = 0._dl  ! Stage 2 added for clumping: the Rayleigh eff neutral fraction is zone-averaged too
+            !##### feature added for clumping / inhomogeneous T_m (Stage 3) #####
+            Calc%tmrec = 0._dl                     ! accumulator for the mass-weighted <T_m> (was: last-pass homogeneous value)
+            if (Calc%doTspin) Calc%tsrec = 0._dl   ! same mass-weighting for T_s (21cm path)
+            !##### end of feature #####
+        end if
+
+        allocate(w(Calc%n_eq,9))
+
+        do izone = 1, n_clump_zones
+        Calc%Nnow = Nnow_homogeneous*clump_delta(izone)   ! scale n_H in the RATE for this zone only
+        !##################################################################
+        !##### end of feature -- per-pass setup + loop body below unchanged
+        !##################################################################
+
+        Calc%Recombination_saha_z=0.d0
+        z = zinitial
+        ainv = 1._dl + z
 
         !       Fudge factor to approximate for low z out of equilibrium effect
         Calc%fu=this%RECFAST_fudge
@@ -713,6 +831,7 @@
         nw   = Calc%n_eq
         rosenbrock_handed_off = .not. this%use_rosenbrock
         rk_settings%reuse_first_derivative = .true.
+        rk_settings%first_derivative_valid = .false.   ! feature added for clumping: fresh solver state each zone pass
 
         do i = 1,Calc%nz
             !       calculate the start and end redshift for the interval at each z
@@ -846,10 +965,31 @@
             x = x0
 
             Calc%zrec(i) = zend
-            Calc%xrec(i) = x
-            Calc%tmrec(i) = y(3)
-            ! effective neutral-scatterer fraction, added for Rayleigh scattering (camb_rayleigh_lewis/recfast.f90:715)
-            Calc%x_rayleigh_eff(i) = (1._dl - x_H) + HeRayleighFac*(1._dl - x_He)*Calc%fHe
+            !##### feature added for clumping / PMF recombination #####
+            ! x_e, the Rayleigh effective neutral-scatterer fraction, and (Stage 3)
+            ! the matter temperature: single homogeneous solve writes directly
+            ! (bit-for-bit with the pre-clumping code); with >1 zone, accumulate the
+            ! SAME sum_i f_V^i Delta_i weighted average over the zones for all three.
+            ! The per-zone Rayleigh eff-fraction is assembled here from this zone's
+            ! own x_H = y(1), x_He = y(2) exactly as the homogeneous one is
+            ! (camb_rayleigh_lewis/recfast.f90:715). y(3) is a*T_m for this zone;
+            ! since a is common across zones at grid point i, averaging y(3) gives
+            ! a*<T_m> with <T_m> = sum_i f_V^i Delta_i T_m^i (mass-weighted mean gas
+            ! temperature -- documented modeling convention, consistent with <X_e>).
+            ! Stage 1 kept only the per-zone total x; Stage 2 added the Rayleigh
+            ! assembly; Stage 3 adds T_m (and T_s below). Only Recombination_saha_z
+            ! stays from the last (homogeneous) pass.
+            if (n_clump_zones == 1) then
+                Calc%xrec(i) = x
+                Calc%x_rayleigh_eff(i) = (1._dl - x_H) + HeRayleighFac*(1._dl - x_He)*Calc%fHe
+                Calc%tmrec(i) = y(3)
+            else
+                Calc%xrec(i) = Calc%xrec(i) + clump_fvol(izone)*clump_delta(izone)*x
+                Calc%x_rayleigh_eff(i) = Calc%x_rayleigh_eff(i) + clump_fvol(izone)*clump_delta(izone) &
+                    * ((1._dl - x_H) + HeRayleighFac*(1._dl - x_He)*Calc%fHe)   ! Stage 2 added for clumping: zone-averaged <x_Rayleigh_eff>
+                Calc%tmrec(i) = Calc%tmrec(i) + clump_fvol(izone)*clump_delta(izone)*y(3)   ! Stage 3 added for clumping T_m: mass-weighted <a*T_m>
+            end if
+            !##### end of feature #####
 
 
             if (Calc%doTspin) then
@@ -866,11 +1006,18 @@
                     y(4) = Tspin/ainv
                 end if
 
-                Calc%tsrec(i) = y(4)
+                if (n_clump_zones == 1) then
+                    Calc%tsrec(i) = y(4)
+                else
+                    Calc%tsrec(i) = Calc%tsrec(i) + clump_fvol(izone)*clump_delta(izone)*y(4)  ! Stage 3 added for clumping T_m: mass-weighted <a*T_s>
+                end if
 
             end if
 
         end do
+
+        end do   !##### feature added for clumping / PMF recombination: end of the per-zone pass loop #####
+        Calc%Nnow = Nnow_homogeneous   ! feature added for clumping: restore global density (read later by dDeltaxe_dtau)
 
         call cubic_spline_regular_second_derivs(-Calc%delta_z,Calc%xrec,Calc%nz,Calc%dxrec)
         ! At low z, adiabatic cooling gives Tmat ~ (1+z)^2, so a*Tmat ~ (1+z).
@@ -900,6 +1047,149 @@
     end select
 
     end subroutine TRecfast_init
+
+    !##################################################################
+    !######### feature added for clumping / PMF recombination ##########
+    !########## Closed-form three-zone decomposition of a clumpy baryon
+    !########## distribution with clumping factor b = <Delta^2> - 1.
+    !##########
+    !########## The three zones (overdensity Delta_i, volume fraction
+    !########## f_V^i) satisfy the three moment constraints
+    !##########   sum_i f_V^i           = 1
+    !##########   sum_i f_V^i Delta_i   = 1        (mass conservation)
+    !##########   sum_i f_V^i Delta_i^2 = 1 + b    (definition of b)
+    !##########
+    !########## A model fixes three of the six parameters -- the
+    !########## low-density overdensity Delta_1, the middle-zone
+    !########## overdensity Delta_2, and the middle-zone volume fraction
+    !########## f_V^2. The other three (Delta_3, f_V^1, f_V^3) then follow
+    !########## in closed form for ARBITRARY (Delta_1, Delta_2, f_V^2):
+    !##########
+    !##########   P = 1 - f_V^2
+    !##########   Q = 1 - f_V^2 Delta_2
+    !##########   R = 1 + b - f_V^2 Delta_2^2
+    !##########
+    !##########   Delta_3 = (R - P Delta_1^2) / (Q - P Delta_1)  -  Delta_1
+    !##########   f_V^3   = (Q - P Delta_1) / (Delta_3 - Delta_1)
+    !##########   f_V^1   = P - f_V^3
+    !##########
+    !########## Derivation: constraint (1) gives f_V^1 = P - f_V^3;
+    !########## reducing constraints (2),(3) by the fixed middle zone and
+    !########## substituting f_V^1 gives
+    !##########   f_V^3 (Delta_3   - Delta_1  ) = Q - P Delta_1
+    !##########   f_V^3 (Delta_3^2 - Delta_1^2) = R - P Delta_1^2
+    !########## and dividing the second by the first isolates Delta_3.
+    !##########
+    !########## Models M1 / M2 are the special case Delta_2 = 1,
+    !########## f_V^2 = 1/3 (only Delta_1 differs: 0.1 for M1, 0.3 for M2).
+    !########## Whenever Delta_2 = 1 (exactly) the general form collapses:
+    !########## Q = P = 1 - f_V^2, R = P + b, and
+    !##########   Delta_3 = 1 + b / (P (1 - Delta_1))
+    !##########   f_V^3   = P (1 - Delta_1) / (Delta_3 - Delta_1)
+    !##########   f_V^1   = P - f_V^3
+    !########## This routine evaluates that compact form for Delta_2 = 1 --
+    !########## the exact historical operation sequence -- so M1/M2 output
+    !########## is bit-for-bit unchanged. Any Delta_2 /= 1 flows through the
+    !########## general P/Q/R form above.
+    !##########
+    !########## Guards (the general form needs these; M1/M2 with b >= 0
+    !########## can never trip them):
+    !##########   b < 0                                     -> error
+    !##########   |Q - P Delta_1|     ~ 0                    -> error (degenerate)
+    !##########   |Delta_3 - Delta_1| ~ 0                    -> error (degenerate)
+    !##########   f_V^1 < 0 / f_V^3 < 0 / any Delta_i <= 0   -> error (unphysical)
+    !##########
+    !########## b = 0 (and clumping = .false.) is returned as a single
+    !########## Delta = 1 zone so the caller reproduces standard RECFAST
+    !########## exactly.
+    !##########
+    !########## Zone order: [low-density, high-density, middle/fixed].
+    !########## The fixed (Delta_2) zone is placed LAST so that
+    !########## TRecfast_init can lift T_m / T_s / saha_z from the final
+    !########## pass (the homogeneous Delta = 1 zone for M1/M2)
+    !########## unambiguously.
+    !##################################################################
+    subroutine TRecfast_ClumpingZones(this, n_zones, zone_delta, zone_fvol)
+    class(TRecfast), intent(in) :: this
+    integer, intent(out) :: n_zones
+    real(dl), intent(out) :: zone_delta(:), zone_fvol(:)
+    real(dl) :: b, D1, D2, f2, P, Q, R, D3, fV1, fV3
+
+    zone_delta = 1._dl
+    zone_fvol = 0._dl
+
+    if (.not. this%clumping .or. this%clumping_b == 0._dl) then
+        ! feature off, or b = 0: exactly the homogeneous universe
+        n_zones = 1
+        zone_delta(1) = 1._dl
+        zone_fvol(1) = 1._dl
+        return
+    end if
+
+    b = this%clumping_b
+    if (b < 0._dl) then
+        call GlobalError('clumping factor b must be non-negative', error_recombination)
+        n_zones = 0
+        return
+    end if
+
+    ! model fixes (Delta_1, Delta_2, f_V^2)
+    select case (this%clumping_model)
+    case (clumping_model_M1)
+        D1 = clumping_M1_Delta1 ; D2 = clumping_Delta2 ; f2 = clumping_fvol2
+    case (clumping_model_M2)
+        D1 = clumping_M2_Delta1 ; D2 = clumping_Delta2 ; f2 = clumping_fvol2
+    case default
+        call GlobalError('clumping_model must be 1 (M1) or 2 (M2)', error_recombination)
+        n_zones = 0
+        return
+    end select
+
+    P = 1._dl - f2
+    if (D2 == 1._dl) then
+        ! mean-density middle zone (Delta_2 = 1): the general form collapses to
+        ! P = Q = 1 - f_V^2, R = P + b, and Delta_3 = 1 + b/(P (1 - Delta_1)).
+        ! Evaluate that compact form (the exact historical operation sequence)
+        ! so models M1/M2 (Delta_2 = 1, f_V^2 = 1/3) are bit-for-bit unchanged.
+        D3 = 1._dl + b/(P*(1._dl - D1))
+        fV3 = P*(1._dl - D1)/(D3 - D1)
+        fV1 = P - fV3
+    else
+        ! general closed form for arbitrary (Delta_1, Delta_2, f_V^2)
+        Q = 1._dl - f2*D2
+        R = 1._dl + b - f2*D2*D2
+        if (abs(Q - P*D1) <= clumping_degenerate_tol) then
+            call GlobalError('degenerate three-zone parameters: Q - P*Delta_1 = 0', error_recombination)
+            n_zones = 0
+            return
+        end if
+        D3 = (R - P*D1*D1)/(Q - P*D1) - D1
+        if (abs(D3 - D1) <= clumping_degenerate_tol) then
+            call GlobalError('degenerate three-zone parameters: Delta_3 = Delta_1', error_recombination)
+            n_zones = 0
+            return
+        end if
+        fV3 = (Q - P*D1)/(D3 - D1)
+        fV1 = P - fV3
+    end if
+
+    ! physicality: never trips for M1/M2 with b >= 0 -- a safety net for other (Delta,f_V) choices
+    if (D1 <= 0._dl .or. D2 <= 0._dl .or. D3 <= 0._dl .or. fV1 < 0._dl .or. fV3 < 0._dl) then
+        call GlobalError('three-zone parameters + b give an unphysical solution: '// &
+            'negative volume fraction or density', error_recombination)
+        n_zones = 0
+        return
+    end if
+
+    n_zones = 3
+    zone_delta(1) = D1 ; zone_fvol(1) = fV1   ! low-density zone
+    zone_delta(2) = D3 ; zone_fvol(2) = fV3   ! high-density zone
+    zone_delta(3) = D2 ; zone_fvol(3) = f2    ! middle/fixed zone (LAST -- see header)
+
+    end subroutine TRecfast_ClumpingZones
+    !##################################################################
+    !################ end of feature ##################################
+    !##################################################################
 
     !       ===============================================================
     subroutine GET_INIT(Calc,z,x_H0,x_He0,x0)
